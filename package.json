@@ -1,0 +1,28 @@
+{
+  "name": "bloodora-backend",
+  "version": "3.0.0",
+  "description": "BloodOra Backend API - Standalone REST API (Node.js + Turso Serverless). Deploy on its own Vercel project/account.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js",
+    "db:init": "node src/db.js --init"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.15.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "socket.io": "^4.7.5",
+    "uuid": "^10.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,12 @@
+node_modules/
+.env
+data/*.db
+data/*.db-*
+uploads/*.jpg
+uploads/*.png
+uploads/*.jpeg
+uploads/*.gif
+uploads/*.webp
+!uploads/.gitkeep
+.DS_Store
+.vercel
