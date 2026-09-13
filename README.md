@@ -1,146 +1,191 @@
-# 🩸 BloodOra — Backend API (standalone)
+# BloodOra Backend
 
-This folder is the **complete, separated backend** of BloodOra. It is a standalone
-Node.js + Express + Turso REST API designed to be deployed on **its own Vercel
-project (even a different Vercel account)**. The frontend (the root of this repo)
-talks to this API over HTTPS. The two deployments are wired together **only via
-environment variables**:
+Production backend for **BloodOra** — blood donation, blood requests, medical
+supplies shop, orders, live chat and Live AI Help.
 
-| Where | Variable | Meaning |
-|---|---|---|
-| **Backend** (this project) | `FRONTEND_URL` | The frontend's Vercel URL — CORS allow-list |
-| **Frontend** (root of repo) | `BACKEND_URL` | This backend's Vercel URL |
+**Stack:** Node.js ≥ 18 · TypeScript (strict, ESM/NodeNext) · Express 4 ·
+Turso/libSQL (`@libsql/client`) · express-session (Turso-backed store) ·
+zod · multer · nodemailer · Groq (OpenAI-compatible) · Vercel Functions.
 
----
-
-## ✨ Features (complete)
-
-- JWT authentication (register / login / logout / me) with single-session enforcement
-- Donor directory + profiles (search by blood group / district / upazila)
-- Blood requests (create as guest or user, urgent flag, fulfill, cancel, filters)
-- Medical shop: products, cart pricing (server-side), checkout with bKash / Nagad /
-  Upay / Rocket / Pathao / Card, Kalai-only delivery (৳10), stock decrement
-- Orders: my orders, order detail, invoice data
-- Messaging: user inbox/sent, send to admin or any user, replies, admin mailbox
-- Full admin panel API: dashboard stats, site settings, site notice, donor
-  verification, promote/demote/delete users, edit users, create admins,
-  impersonation + switch-back, product CRUD with image upload, order management
-  (confirm payment / update status), database backup info
-- Image uploads (profile pictures, product photos) served at `/uploads/*`
-- Public content: site settings, Anti-D info, resources, Bangladesh location data
-- Socket.IO live-chat endpoint (same as the original monolith)
-- Health check: `GET /api/health`
-
-## 🚀 Deploy on Vercel (separate account)
-
-1. Push this repo (or just sync the `backend/` folder) to the other Vercel account.
-   - Easiest: create a new repo containing only the contents of `backend/`,
-     or set the Vercel **Root Directory** to `backend` when importing this repo.
-2. Vercel auto-detects Node.js (see `vercel.json`). Deploy.
-3. In **Vercel → Project → Settings → Environment Variables**, set (as plain values):
-
-   ```
-   FRONTEND_URL=https://<your-frontend-project>.vercel.app
-   JWT_SECRET=<long random string>
-   TURSO_DATABASE_URL=libsql://<your-db>-<name>.turso.io
-   TURSO_AUTH_TOKEN=<token>
-   SUPER_ADMIN_NAME=Super Admin
-   SUPER_ADMIN_EMAIL=you@example.com
-   SUPER_ADMIN_PASSWORD=<strong password>
-   SUPER_ADMIN_PHONE=+8801XXXXXXXXX
-   ```
-
-4. Redeploy. Check `https://<backend>.vercel.app/api/health` → should say `healthy`.
-
-> Multiple frontend URLs (preview + production + custom domain)? Separate them with
-> commas in `FRONTEND_URL`.
-
-## 💻 Run locally
-
-```bash
-cd backend
-npm install
-cp .env.example .env     # fill Turso values or leave empty for local SQLite file
-npm run dev              # http://localhost:4000
+```
+Frontend (dmoshiur/lspk)  →  HTTPS  →  /api/*  →  routes → controllers
+   → services (business rules, ApiError) → repositories (all SQL) → db/query → Turso
 ```
 
-## 🔌 API overview
+Routes are thin (validation only); **no SQL or business logic in route files**.
+Every table the frontend needs lives in the database — there is no in-process
+cache of business state. The only per-instance state is a best-effort rate
+limit window (documented in `src/middleware/rateLimit.ts`).
 
-All endpoints are JSON. Authenticated endpoints expect
-`Authorization: Bearer <token>` (token comes from `/api/auth/login` or `/api/auth/register`).
+## Getting started (local)
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| GET | `/api/health` | – | Health + DB check |
-| GET | `/api/meta/home` | – | Homepage aggregate data |
-| GET | `/api/meta/settings` | – | Site settings (public) |
-| GET | `/api/meta/locations` | – | Divisions/districts/upazilas |
-| GET | `/api/meta/antid` | – | Anti-D info list |
-| GET | `/api/meta/resources` | – | Resources (filter `?category=`) |
-| GET | `/api/meta/chat-auth` | opt | Chat widget identity |
-| POST | `/api/auth/register` | – | Register (multipart, optional `profile_pic`) |
-| POST | `/api/auth/login` | – | Login → `{ token, user }` |
-| POST | `/api/auth/logout` | ✅ | Invalidate session token |
-| GET | `/api/auth/me` | ✅ | Current user |
-| GET | `/api/donors` | – | Verified donors (`?bg=&dist=&upa=&age_min=`) |
-| GET | `/api/users/:id` | – | Public profile |
-| PUT | `/api/users/me` | ✅ | Edit profile (multipart, optional `profile_pic`) |
-| POST | `/api/users/me/toggle-status` | ✅ | Toggle donation availability |
-| POST | `/api/users/me/apply-verification` | ✅ | Apply for donor verification |
-| GET | `/api/blood-requests` | – | Open requests (`?bg=&division=&dist=&urgent=`) |
-| GET | `/api/blood-requests/urgent` | – | Urgent open requests |
-| POST | `/api/blood-requests` | opt | Create request |
-| GET | `/api/blood-requests/:id` | – | Request detail |
-| POST | `/api/blood-requests/:id/fulfill` | ✅ | Mark fulfilled |
-| POST | `/api/blood-requests/:id/cancel` | ✅ | Cancel (owner/admin) |
-| POST | `/api/blood-requests/urgent-contact` | opt | Urgent-page contact form |
-| GET | `/api/shop/products` | – | Products (`?category=&search=`) |
-| GET | `/api/shop/products/:id` | – | Product detail |
-| GET | `/api/shop/categories` | – | Category list |
-| POST | `/api/shop/cart/validate-item` | – | Stock/availability check |
-| POST | `/api/shop/cart/resolve` | – | Price a cart `{ "1": 2 }` |
-| GET | `/api/shop/checkout/context` | ✅ | Gateway numbers + saved payment info |
-| POST | `/api/shop/orders` | ✅ | Place order (cart + payment + address) |
-| GET | `/api/shop/orders/mine` | ✅ | My orders |
-| GET | `/api/shop/orders/:id` | ✅ | Order detail (owner/admin) |
-| GET | `/api/messages` | ✅ | Inbox (received/sent/unread) |
-| POST | `/api/messages` | ✅ | Send message |
-| GET | `/api/messages/:id` | ✅ | Read (marks read) |
-| GET | `/api/messages/:id/original` | ✅ | Original for reply form |
-| POST | `/api/messages/:id/reply` | ✅ | Reply |
-| GET | `/api/messages/admin/list` | 👑 | Admin mailbox |
-| POST | `/api/messages/admin/reply/:id` | 👑 | Admin reply |
-| GET | `/api/admin/dashboard` | 👑 | Users + stats + notice + settings |
-| GET/POST | `/api/admin/settings` | 👑 | Site settings |
-| POST | `/api/admin/notice` | 👑 | Set site notice |
-| GET | `/api/admin/notice/clear` | 👑 | Clear notice |
-| POST | `/api/admin/verify-donor/:id` | 👑 | Verify donor |
-| POST | `/api/admin/promote/:id` | 👑★ | Make admin |
-| POST | `/api/admin/demote/:id` | 👑★ | Remove admin |
-| DELETE | `/api/admin/user/:id` | 👑★ | Delete user |
-| POST | `/api/admin/user/update/:id` | 👑★ | Edit user (+ reset password) |
-| GET | `/api/admin/user/details/:id` | 👑★ | User details JSON |
-| POST | `/api/admin/create-admin` | 👑★ | Create admin account |
-| POST | `/api/admin/impersonate/:id` | 👑★ | Become user → new token |
-| POST | `/api/admin/switch-back` | 👑★ | Revoke impersonation |
-| GET | `/api/admin/products` | 👑 | All products |
-| POST | `/api/admin/products` | 👑 | Add product (multipart `image`) |
-| PUT | `/api/admin/products/:id` | 👑 | Edit product |
-| DELETE | `/api/admin/products/:id` | 👑 | Delete product |
-| GET | `/api/admin/orders` | 👑 | All orders (`?status=`) |
-| GET | `/api/admin/orders/:id` | 👑 | Order detail + items |
-| POST | `/api/admin/orders/:id/confirm-payment` | 👑 | Confirm payment |
-| POST | `/api/admin/orders/:id/status` | 👑 | Update status |
-| GET | `/api/admin/backup` | 👑★ | Backup guidance |
+```bash
+cp .env.example .env      # leave TURSO_* empty → uses ./data/local.db (dev only)
+npm install
+npm run make-defaults     # generates uploads/*.png + src/data/defaults.ts (idempotent)
+npm run dev               # http://0.0.0.0:4000  (same app as production + a server)
+```
 
-✅ = logged in · 👑 = admin · ★ = super admin
+The first request runs an idempotent bootstrap: DDL → settings defaults →
+product seeds → super-admin provisioning (see `src/db/init.ts`).
 
-## ⚠️ Notes
+## Deployment (Vercel serverless)
 
-- **Database**: always set `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` in production.
-  Without them the app falls back to an ephemeral `/tmp` SQLite on Vercel
-  (data will not persist) — this is dev-only behaviour.
-- **Uploads**: stored on the function filesystem (`/tmp/uploads` on Vercel). They
-  survive while the function instance lives; for permanent storage consider object
-  storage (e.g. Cloudflare R2) later — the API surface will not change.
-- **Secrets**: `JWT_SECRET` must stay on the backend only. The frontend never sees it.
+`vercel.json` compiles **`src/server.ts`** with `@vercel/node`. The file's
+default export is the Express app itself (an Express app *is* a
+`function(req, res)`), which is exactly what the Node runtime requires — this
+fixes `Invalid export found in module /var/task/server.js — The default export
+must be a function or server`. There is **no `app.listen()`** in the entry
+point; `src/dev.ts` is the only place a server is owned.
+
+Required environment variables (all backend-only, never sent to the frontend):
+
+| Var | Purpose |
+| --- | --- |
+| `TURSO_DATABASE_URL` | `libsql://…` remote database (required in prod) |
+| `TURSO_AUTH_TOKEN` | Turso auth token (required in prod) |
+| `JWT_SECRET` | signs session JWTs (required in prod) |
+| `FRONTEND_URL` | comma-separated CORS allow-list (required in prod) |
+| `COOKIE_DOMAIN` | optional shared cookie domain |
+| `SUPER_ADMIN_EMAIL/PASSWORD/NAME/PHONE` | idempotent super-admin bootstrap |
+| `GROQ_API_KEY`, `AI_*` | Live AI Help (admin panel can override) |
+| `SMTP_*` | transactional mail (admin panel can override; skip-logged when off) |
+
+Production boot **fails fast** if any required variable is missing
+(`src/config/env.ts`).
+
+## Security model
+
+- **Sessions** — `express-session` with `TursoSessionStore`
+  (`src/sessions/tursoStore.ts`): every session row lives in the `sessions`
+  table, so login state survives cold starts and works across instances.
+  The session cookie `connect.sid` is `httpOnly`, `sameSite=lax`,
+  `secure` in production.
+- **Auth** — each login mints a JWT `{uid, sid, adm}` stored in the session
+  (cookie path) or returned in the response body (bearer path). On **every**
+  request the token's `sid` is re-checked against `users.session_token`, so
+  **logout revokes all tokens immediately**, including already-issued JWTs.
+- **Authorization** — admin/super-admin role is re-read from the database on
+  every admin request; JWT claims are never trusted alone. Super admins are
+  protected from demotion/deletion by non-super-admins; self-demotion and
+  self-delete are blocked.
+- **CORS** — only origins listed in `FRONTEND_URL` are accepted; others get
+  `403 CORS_NOT_ALLOWED` (handled centrally, not a 500).
+- **Secrets** — SMTP password and AI API key are stored only in the DB
+  `settings` table; the admin panel receives masked values (`••••••••`) and
+  sends that marker back to keep them unchanged.
+- **Orders** — order + line items + stock decrement run in a **single
+  transaction** (`orderRepo.placeTx`); stock is re-checked inside the
+  transaction so overselling produces `422 OUT_OF_STOCK`, never a ghost order
+  or negative stock.
+- **Logging** — structured JSON, redacts `*secret/token/password/key/cookie*`
+  fields, never logs request bodies; 5xx logs include stack + path.
+
+## API overview
+
+Base: `/api` — errors always return `{ error: { code, message, details? } }`.
+
+| Method & path | Auth | Description |
+| --- | --- | --- |
+| `GET /api/health` | – | liveness + real `SELECT 1` DB round-trip |
+| `GET /api/meta` | – | site settings, categories, divisions, payment methods |
+| `POST /api/auth/register` | – | create account (first account = super admin) |
+| `POST /api/auth/login` | – | login → `{user, token}` + session cookie |
+| `POST /api/auth/logout` | cookie/bearer | rotate session token (revokes JWTs) |
+| `GET /api/auth/me` | ✓ | current user |
+| `PATCH /api/auth/profile` | ✓ | update name/email/phone/blood/city |
+| `POST /api/auth/password` | ✓ | change password |
+| `POST /api/auth/profile/image` | ✓ | multipart `image` → profile picture |
+| `GET /api/donors` | – | verified donor directory |
+| `GET /api/shop/products` | – | list (`?category=&search=&page=`) |
+| `GET /api/shop/products/:id` | – | product by id or slug + approved reviews |
+| `POST /api/shop/cart` | – | price a cart server-side (returns out-of-stock list) |
+| `POST /api/shop/orders` | ✓ | place order (atomic stock deduction) |
+| `GET /api/shop/orders/mine` | ✓ | my orders |
+| `GET /api/shop/orders/:id` | owner | one order |
+| `POST /api/shop/orders/:id/cancel` | owner | cancel while pending (restocks) |
+| `POST /api/shop/reviews` | ✓ | review a purchased product (moderated) |
+| `POST /api/shop/admin/products` | admin | create product (`image` optional) |
+| `PUT /api/shop/admin/products/:id` | admin | update product |
+| `DELETE /api/shop/admin/products/:id` | admin | delete product |
+| `PATCH /api/shop/admin/products/:id/stock` | admin | `{delta}` stock adjust |
+| `GET /api/shop/admin/orders` | admin | orders (`?status=`) |
+| `GET /api/shop/admin/orders/:id` | admin | one order + items |
+| `PATCH /api/shop/admin/orders/:id/status` | admin | advance status / confirm payment |
+| `GET /api/blood-requests` | – | public board (`?status=&group=&page=`) |
+| `POST /api/blood-requests` | – | post request (division/district/upazila or `location`) |
+| `GET /api/blood-requests/mine` | ✓ | my requests |
+| `PATCH /api/admin/blood-requests/:id/status` | admin | confirm/fulfil/cancel |
+| `DELETE /api/admin/blood-requests/:id` | admin | delete |
+| `POST /api/messages` | ✓ | user → support desk |
+| `GET /api/messages/mine` | ✓ | my messages + unread |
+| `POST /api/messages/read` | ✓ | mark read |
+| `GET /api/admin/messages/inbox` | admin | desk inbox |
+| `POST /api/admin/messages/:id/reply` | admin | reply to user |
+| `GET /api/chat` | ✓ | my thread + chat key |
+| `POST /api/chat/send` | ✓ | user message |
+| `GET /api/chat/poll?since=` | ✓ | poll new entries |
+| `GET /api/admin/chat` | admin | threads + unread |
+| `GET /api/admin/chat/:userId` | admin | thread history |
+| `POST /api/admin/chat/:userId/reply` | admin | reply |
+| `POST /api/admin/chat/reply-by-message/:id` | admin | reply addressed by message id |
+| `POST /api/ai/ask` | – | Live AI Help (`{question, history?}`) |
+| `GET /api/ai/status` | – | availability flag (no secrets) |
+| `GET /api/admin/ai/preview` | admin | current knowledge base |
+| `POST /api/uploads` | ✓ | generic image upload (multipart `file`) |
+| `GET /uploads/:file` · `GET /api/uploads/:file` | – | serve stored image |
+| `GET /api/admin/dashboard` | admin | stats, recent orders/users, low stock |
+| `GET /api/admin/activities` | admin | live activity feed |
+| `GET /api/admin/content` | admin | content index for the CMS view |
+| `GET /api/admin/users` | admin | list/search users |
+| `PATCH /api/admin/users/:id/role` | admin | `user`/`admin`/`super_admin` |
+| `PATCH /api/admin/users/:id/verified` | admin | donor verification |
+| `DELETE /api/admin/users/:id` | admin | delete (guards: self, super-admin) |
+| `POST /api/admin/impersonate` | admin | `{user_id}` → token bound to target |
+| `POST /api/admin/switch-back` | admin | return to the original admin |
+| `GET /api/admin/settings` | admin | settings (secrets masked) |
+| `PUT /api/admin/settings` | admin | update (send `••••••••` to keep a secret) |
+| `POST /api/admin/settings/logo` | admin | replace logo (multipart `logo`) |
+| `GET /api/admin/reviews/pending` | admin | moderation queue |
+| `POST /api/admin/reviews/:id/approve` | admin | approve/reject (`?approve=0`) |
+| `DELETE /api/admin/reviews/:id` | admin | delete review |
+
+### Error codes
+
+| Status | Code (examples) |
+| --- | --- |
+| 400 | `VALIDATION_ERROR`, `BAD_JSON`, `BAD_BLOOD_GROUP`, `UPLOAD_ERROR` |
+| 401 | `UNAUTHENTICATED`, `BAD_CREDENTIALS`, `SESSION_INVALID`, `LOGIN_REQUIRED` |
+| 403 | `CORS_NOT_ALLOWED`, `FORBIDDEN`, `ADMIN_ONLY`, `SUPER_ADMIN_ONLY`, `OWN_ORDERS_ONLY` |
+| 404 | `NOT_FOUND`, `USER_NOT_FOUND`, `PRODUCT_NOT_FOUND`, `ORDER_NOT_FOUND` |
+| 409 | `EMAIL_TAKEN`, `CONFLICT`, `SLUG_TAKEN`, `STOCK_CHANGED`, `REVIEW_TOO_SOON`, `NO_PRIOR_ORDER` |
+| 413 | `PAYLOAD_TOO_LARGE` |
+| 422 | `UNPROCESSABLE`, `EMPTY_CART`, `OUT_OF_STOCK`, `DELIVERY_AREA_NOT_SERVED` |
+| 429 | `RATE_LIMITED` |
+| 500 | `INTERNAL` (body stays generic in production; details logged) |
+| 502/503/504 | `AI_UPSTREAM_ERROR`, `AI_NOT_CONFIGURED`, `AI_TIMEOUT`, `DB_NOT_READY` |
+
+## Scripts
+
+| Script | What |
+| --- | --- |
+| `npm run dev` | local server (tsx, same app as prod) |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run build` | compile to `dist/` |
+| `npm run db:init` | apply schema + seeds (idempotent) |
+| `npm run db:backup` | dump tables to `data/backup-*.json` (dev) |
+| `npm run make-defaults` | regenerate default product images |
+
+## Verification performed
+
+- `tsc --noEmit` and `tsc` build: **0 errors**
+- `typeof import("./dist/server.js").default === "function"`: **true** (valid
+  Vercel Functions export, no `app.listen` in the module)
+- End-to-end suite against a fresh database: health, bootstrap, register/
+  login/logout, session persistence across restart, admin authorization,
+  full shop flow (cart → order → stock 50→48 → status lifecycle), over-qty
+  rejection with zero ghost orders, delivery-area + empty-cart 422s, blood
+  request field mapping + fulfilment, review moderation, message inbox/reply,
+  chat send/poll/admin reply, AI 503-when-unconfigured + preview, activity
+  feed, upload byte-exact round-trip on both mounts, CORS allow + 403 deny,
+  429 rate limiting — **all green**.

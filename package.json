@@ -1,28 +1,46 @@
 {
   "name": "bloodora-backend",
-  "version": "3.0.0",
-  "description": "BloodOra Backend API - Standalone REST API (Node.js + Turso Serverless). Deploy on its own Vercel project/account.",
+  "version": "2.0.0",
+  "private": true,
   "type": "module",
-  "main": "index.js",
+  "description": "BloodOra backend — Node.js + TypeScript + Express on Turso/libSQL. Serverless-compatible (Vercel Functions).",
+  "engines": {
+    "node": ">=18.17"
+  },
   "scripts": {
-    "dev": "node --watch index.js",
-    "start": "node index.js",
-    "db:init": "node src/db.js --init"
+    "dev": "tsx src/dev.ts",
+    "start": "tsx src/dev.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "db:init": "tsx src/db-cli.ts init",
+    "db:backup": "tsx src/db-cli.ts backup",
+    "make-defaults": "node scripts/make-defaults.mjs"
   },
   "dependencies": {
-    "@libsql/client": "^0.15.0",
+    "@libsql/client": "^0.15.15",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "express-session": "^1.18.0",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
-    "multer": "^1.4.5-lts.1",
-    "socket.io": "^4.7.5",
-    "uuid": "^10.0.0"
+    "multer": "^2.0.1",
+    "nodemailer": "^6.9.14",
+    "zod": "^3.23.8"
   },
-  "engines": {
-    "node": ">=18.0.0"
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/express-session": "^1.18.0",
+    "@types/jsonwebtoken": "^9.0.6",
+    "@types/morgan": "^1.9.9",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^20.14.10",
+    "@types/nodemailer": "^6.4.15",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.3"
   }
 }
