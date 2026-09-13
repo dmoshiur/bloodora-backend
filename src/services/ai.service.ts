@@ -5,6 +5,7 @@ import { aiMessageRepo } from "../repos/aiMessage.repo.js";
 import { navigationService } from "./navigation.service.js";
 import { extractAnswer, sanitizeAnswer } from "./aiSanitize.js";
 import { config } from "../config/env.js";
+import { clampToRemaining } from "../utils/deadline.js";
 import { ApiError, randomId } from "../utils/errors.js";
 import { str } from "../utils/validate.js";
 import { logger } from "../utils/logger.js";
@@ -13,25 +14,87 @@ import type { AiConfig, AiMessage, AiResult, SafeUser } from "../types.js";
 const MAX_CONTEXT_MESSAGES = 12;
 
 /**
- * `fetch` with a hard deadline.
+ * Provider-call attempt budget. `AI_TIMEOUT_MS` is the TOTAL for all of them —
+ * see the retry loop in `ask()`, which spends down from a single deadline rather
+ * than granting each attempt the full timeout.
+ */
+const MAX_AI_ATTEMPTS = 2;
+const AI_RETRY_BACKOFF_MS = 400;
+const AI_RATE_LIMIT_BACKOFF_MS = 700;
+/**
+ * `GET /models` is a small catalogue read and has a static fallback, so it gets a
+ * fraction of the AI budget rather than all of it.
+ */
+const MODEL_CATALOGUE_TIMEOUT_MS = 4_000;
+/**
+ * Time held back from the AI budget for persisting the turn, extracting links and
+ * writing the response. Without it the provider call could consume the entire
+ * invocation and the answer would be computed but never delivered.
+ */
+const AI_POST_PROCESS_RESERVE_MS = 600;
+
+/** A provider response whose BODY has already been read, inside the deadline. */
+interface AiHttpResponse {
+  ok: boolean;
+  status: number;
+  text: string;
+  ms: number;
+}
+
+/**
+ * `fetch` with a hard deadline that covers the BODY, not just the headers.
  *
  * The chat completion path already aborted via AbortController, but the two admin
  * round-trips (`/admin/test`, `/admin/models`) called bare `fetch()` with no
  * signal at all — a Groq endpoint that accepted the connection and never replied
  * would hold that request open until the platform killed the function. Both now
  * share this helper.
+ *
+ * Two further defects this closes:
+ *
+ *  - The timer used to be cleared in a `finally` around `await fetch(...)`, which
+ *    resolves as soon as the response HEAD arrives. That disarmed the
+ *    AbortController before `res.text()` / `res.json()` ran, so a provider that
+ *    sent headers and then stalled the body hung the request with no deadline at
+ *    all. The body is now read here, while the timer is still armed.
+ *  - `ms` is clamped to the time left in this invocation, so the provider call can
+ *    never be the thing that runs past the platform's function limit.
  */
-async function fetchWithTimeout(url: string, init: RequestInit, ms = config.aiTimeoutMs): Promise<Response> {
+async function fetchWithTimeout(url: string, init: RequestInit, ms: number): Promise<AiHttpResponse> {
+  // `ms` may legitimately be Infinity (a caller with no deadline of its own, e.g.
+  // outside an HTTP request). Node's setTimeout treats any delay above 2^31-1 as
+  // 1 and fires on the NEXT TICK, so an infinite delay must never reach it —
+  // normalise to the configured AI budget first, which env.ts has already clamped
+  // to a finite value, then to whatever this invocation has left.
+  const requested = Number.isFinite(ms) && ms > 0 ? ms : config.aiTimeoutMs;
+  const clamped = clampToRemaining(requested);
+  const effective = Number.isFinite(clamped) && clamped > 0 ? clamped : requested;
+  if (effective <= 0) {
+    throw Object.assign(new Error("No invocation budget left for the AI provider call"), { name: "TimeoutError" });
+  }
+
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
+  const started = Date.now();
+  const timer = setTimeout(() => controller.abort(), effective);
   timer.unref?.();
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    // Read the body BEFORE the timer is cleared, so a stalled body is aborted too.
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text, ms: Date.now() - started };
   } finally {
     clearTimeout(timer);
   }
 }
 
+/** Parse a provider body without ever throwing (some gateways return HTML). */
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const MAX_ANSWER_CHARS = 4000;
@@ -180,29 +243,66 @@ export const aiService = {
     // One retry on a transient failure (network error, 5xx, provider 429).
     // Never retry a 4xx: a bad key or an invalid model will fail identically and
     // retrying only doubles the latency of an error the admin must see.
-    let res: Response | null = null;
+    //
+    // THE BUDGET IS TOTAL, NOT PER ATTEMPT. It used to be `AI_TIMEOUT_MS` (25 s)
+    // for EACH of two attempts plus a backoff sleep — 50.4 s of socket-holding
+    // inside a function the platform kills at 10 s. That is what produced the
+    // production `504 GATEWAY_TIMEOUT / FUNCTION_INVOCATION_TIMEOUT`: Vercel ended
+    // the invocation long before this loop could report anything, and answered
+    // with an HTML page the frontend's `res.json()` could not parse, so its
+    // spinner never cleared. Every attempt now spends down from ONE deadline
+    // which is itself clamped to the time left in the invocation.
+    // Reserve a tail so the turn can still be persisted and the response still be
+    // written after the provider replies. Handing the provider every last
+    // millisecond would make the post-call writes (and the response itself) race
+    // the request failsafe.
+    const aiBudgetMs = Math.max(0, clampToRemaining(config.aiTimeoutMs) - AI_POST_PROCESS_RESERVE_MS);
+    const deadlineAt = Date.now() + aiBudgetMs;
+    // Below this there is no point starting an attempt: it would be aborted
+    // mid-stream and we would have paid for a round trip we cannot use.
+    const MIN_ATTEMPT_MS = 1_500;
+    const timeLeft = () => deadlineAt - Date.now();
+    const tooSlowReply = "The AI provider took too long to respond — please try again.";
+
+    let res: AiHttpResponse | null = null;
     let lastError: ApiError | null = null;
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-      try {
-        // Bounded by AI_TIMEOUT_MS (default 25 s) through the same helper the
-        // admin round-trips use, so this file contains exactly one bare fetch()
-        // and it is the one inside the timeout wrapper. A provider that stalls
-        // must produce a 504 the caller can see, not an open socket the platform
-        // has to kill. Keep AI_TIMEOUT_MS under the deployment's maxDuration.
-        res = await fetchWithTimeout(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
-          body: payload,
+    for (let attempt = 1; attempt <= MAX_AI_ATTEMPTS; attempt += 1) {
+      const left = timeLeft();
+      if (left < MIN_ATTEMPT_MS) {
+        logger.warn("ai: not enough invocation budget left for a provider attempt", {
+          attempt,
+          leftMs: Math.round(left),
+          budgetMs: Number.isFinite(aiBudgetMs) ? Math.round(aiBudgetMs) : null,
         });
+        throw lastError ?? new ApiError(504, "AI_TIMEOUT", tooSlowReply);
+      }
+      try {
+        // Bounded by the remaining budget through the same helper the admin
+        // round-trips use, so this file contains exactly one bare fetch() and it
+        // is the one inside the timeout wrapper. A provider that stalls must
+        // produce a 504 the caller can see, not an open socket the platform has
+        // to kill.
+        res = await fetchWithTimeout(
+          url,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
+            body: payload,
+          },
+          left,
+        );
       } catch (err) {
-        if ((err as Error).name === "AbortError") {
-          lastError = new ApiError(504, "AI_TIMEOUT", "The AI provider took too long to respond — please try again.");
+        const name = (err as Error)?.name;
+        if (name === "AbortError" || name === "TimeoutError") {
+          lastError = new ApiError(504, "AI_TIMEOUT", tooSlowReply);
+          logger.warn("ai: provider call hit its deadline", { attempt, err: String((err as Error)?.message ?? err) });
         } else {
           logger.error("ai: provider request failed", { attempt, err: String((err as Error)?.message ?? err) });
           lastError = new ApiError(502, "AI_UPSTREAM_ERROR", "The AI provider could not be reached. Please try again later.");
         }
-        if (attempt === 1) {
-          await sleep(400);
+        // Only retry if there is still room for the backoff AND a full attempt.
+        if (attempt < MAX_AI_ATTEMPTS && timeLeft() >= MIN_ATTEMPT_MS + AI_RETRY_BACKOFF_MS) {
+          await sleep(AI_RETRY_BACKOFF_MS);
           continue;
         }
         throw lastError;
@@ -210,33 +310,28 @@ export const aiService = {
 
       if (res.ok) break;
 
-      const text = await res.text().catch(() => "");
+      const text = res.text;
       logger.error("ai: provider returned error", { attempt, status: res.status, body: text.slice(0, 300) });
       if (res.status === 401 || res.status === 403) {
         throw new ApiError(503, "AI_NOT_CONFIGURED", "The AI API key is invalid or has no access. An admin should update Settings → AI.");
       }
-      if (res.status === 429) {
-        lastError = new ApiError(429, "AI_RATE_LIMITED", "The AI provider is rate-limiting us — please wait a moment and retry.");
-        if (attempt === 1) {
-          await sleep(700);
-          continue;
-        }
-        throw lastError;
+      const retryable = res.status === 429 || res.status >= 500;
+      lastError =
+        res.status === 429
+          ? new ApiError(429, "AI_RATE_LIMITED", "The AI provider is rate-limiting us — please wait a moment and retry.")
+          : new ApiError(502, "AI_UPSTREAM_ERROR", "The AI provider returned an error. Please try again later.");
+      if (!retryable) throw lastError;
+      const backoff = res.status === 429 ? AI_RATE_LIMIT_BACKOFF_MS : AI_RETRY_BACKOFF_MS;
+      if (attempt < MAX_AI_ATTEMPTS && timeLeft() >= MIN_ATTEMPT_MS + backoff) {
+        await sleep(backoff);
+        continue;
       }
-      if (res.status >= 500) {
-        lastError = new ApiError(502, "AI_UPSTREAM_ERROR", "The AI provider returned an error. Please try again later.");
-        if (attempt === 1) {
-          await sleep(400);
-          continue;
-        }
-        throw lastError;
-      }
-      throw new ApiError(502, "AI_UPSTREAM_ERROR", "The AI provider returned an error. Please try again later.");
+      throw lastError;
     }
 
     if (!res || !res.ok) throw lastError ?? new ApiError(502, "AI_UPSTREAM_ERROR", "The AI provider returned an error.");
 
-    const data = (await res.json().catch(() => null)) as {
+    const data = parseJson(res.text) as {
       choices?: Array<{ message?: { content?: unknown } }>;
       usage?: { total_tokens?: number; completion_tokens?: number; prompt_tokens?: number };
       model?: string;
@@ -393,7 +488,6 @@ export const aiService = {
   /** POST /api/ai/admin/test — real round-trip against the provider. */
   async adminTest(body: { api_key?: unknown; model?: unknown; base_url?: unknown }): Promise<{ success: boolean; ok: boolean; ms?: number; model?: string; message: string; reply?: string }> {
     const cfg = await this.getConfig();
-    const s = await loadSettings();
     const key = str(body.api_key) || "";
     const apiKey = key && !key.includes("•") ? key : cfg.apiKey;
     if (!apiKey) return { success: false, ok: false, message: "❌ No API key. Paste a Groq key or save one first." };
@@ -401,23 +495,31 @@ export const aiService = {
     const baseUrl = (str(body.base_url) || cfg.baseUrl).replace(/\/+$/, "");
     const started = Date.now();
     try {
-      const r = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: "system", content: "You are testing a connection. Reply with exactly: OK" },
-            { role: "user", content: "ping" },
-          ],
-          max_completion_tokens: 20,
-          temperature: 0,
-        }),
-      });
+      const r = await fetchWithTimeout(
+        `${baseUrl}/chat/completions`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: "system", content: "You are testing a connection. Reply with exactly: OK" },
+              { role: "user", content: "ping" },
+            ],
+            max_completion_tokens: 20,
+            temperature: 0,
+          }),
+        },
+        // The admin test is a real round trip, so it gets the same total budget as
+        // a chat turn — clamped by fetchWithTimeout to whatever the invocation has
+        // left. `started` is kept for the wall-clock figure the panel displays.
+        config.aiTimeoutMs,
+      );
       const ms = Date.now() - started;
-      const text = await r.text();
-      let data: { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string }; message?: string } | null = null;
-      try { data = JSON.parse(text); } catch { /* not JSON */ }
+      const text = r.text;
+      const data = parseJson(text) as
+        | { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string }; message?: string }
+        | null;
       if (!r.ok) {
         return { success: false, ok: false, ms, model, message: `❌ Groq rejected the request (HTTP ${r.status}): ${data?.error?.message || data?.message || text.slice(0, 200)}` };
       }
@@ -426,9 +528,13 @@ export const aiService = {
       const reply = sanitizeAnswer(extractAnswer(data?.choices?.[0])).text.trim();
       return { success: true, ok: true, ms, model, message: `✅ Connection OK — ${model} replied “${reply}” in ${ms} ms.`, reply };
     } catch (e) {
-      return { success: false, ok: false, message: `❌ Could not reach Groq: ${(e as Error).message}` };
+      // A TimeoutError here means the provider did not answer inside the budget —
+      // say that plainly instead of leaking an "AbortError" into the admin panel.
+      const reason = (e as Error)?.name === "TimeoutError" || (e as Error)?.name === "AbortError"
+        ? `the provider did not respond within ${Math.round(config.aiTimeoutMs / 1000)}s`
+        : (e as Error).message;
+      return { success: false, ok: false, message: `❌ Could not reach Groq: ${reason}` };
     }
-    void s;
   },
 
   /** GET /api/ai/admin/models — live catalogue, falling back to static. */
@@ -442,9 +548,12 @@ export const aiService = {
         `${cfg.baseUrl.replace(/\/+$/, "")}/models`,
         { headers: { Authorization: `Bearer ${cfg.apiKey}` } },
         // The model catalogue is a small GET; it should never need the full budget.
-        Math.min(config.aiTimeoutMs, 10_000),
+        // It was capped at exactly 10 s — the same as the platform's whole
+        // invocation, so it could still be killed before falling back to the
+        // static catalogue below.
+        Math.min(config.aiTimeoutMs, MODEL_CATALOGUE_TIMEOUT_MS),
       );
-      const data = (await r.json()) as { data?: Array<{ id?: string }>; error?: { message?: string } };
+      const data = parseJson(r.text) as { data?: Array<{ id?: string }>; error?: { message?: string } } | null;
       if (!r.ok) throw new Error(data?.error?.message || `HTTP ${r.status}`);
       const ids = (data?.data || []).map((m) => m.id).filter(Boolean) as string[];
       ids.sort();

@@ -1,4 +1,4 @@
-import { get, all, run } from "../db/query.js";
+import { get, all, run, batch } from "../db/query.js";
 
 export const settingsRepo = {
   async get(key: string): Promise<string | null> {
@@ -14,10 +14,25 @@ export const settingsRepo = {
     );
   },
 
+  /**
+   * Write many keys in ONE round trip.
+   *
+   * This used to loop `await this.set(k, v)` — one HTTPS request per key against a
+   * remote Turso database. Saving the Admin → Settings panel writes a dozen keys
+   * and the AI panel writes nine, so a single "Save" cost 9-12 round trips before
+   * the response could even start. Same statements, same transaction semantics,
+   * one request.
+   */
   async setMany(values: Record<string, string | null>): Promise<void> {
-    for (const [k, v] of Object.entries(values)) {
-      await this.set(k, v);
-    }
+    const entries = Object.entries(values);
+    if (entries.length === 0) return;
+    await batch(
+      entries.map(([k, v]) => [
+        `INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        [k, v],
+      ]),
+    );
   },
 
   async all(): Promise<Record<string, string>> {

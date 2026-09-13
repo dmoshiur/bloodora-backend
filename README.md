@@ -78,12 +78,21 @@ public timeout instead of a readable error.
 exports, "nothing but `dev.ts` listens", persistent session store, documented
 env vars) so a regression fails in CI rather than on `vercel deploy`.
 
-> `maxDuration` is deliberately not set. Values above 10 s are rejected on the
-> Hobby plan and fail the deployment; raise it in the project settings (or here)
-> only on a plan that allows it. Long-lived SSE endpoints
-> (`/api/meta/activity/stream`, `/api/support/stream`,
+> `maxDuration` is pinned to **10** — the highest value the Hobby plan accepts
+> (anything above it fails the deployment). It is set explicitly rather than left
+> to a plan default so that the application can derive its own deadlines from the
+> same number: `FUNCTION_MAX_DURATION_MS` must always mirror it, and
+> `npm run test:budget` fails if the two disagree.
+>
+> Long-lived SSE endpoints (`/api/meta/activity/stream`, `/api/support/stream`,
 > `/api/support/admin/stream`) poll the database rather than holding process
-> state, so they degrade gracefully when an invocation is capped.
+> state, and end themselves at `SSE_MAX_MS` before the invocation is capped, so
+> the client always sees a clean close and can reconnect or fall back to polling.
+>
+> **Keep the function region close to the Turso database.** Every query is a
+> separate HTTPS round trip, so a function in `bom1` talking to a database in
+> `eu-central-1` pays ~150 ms per query on every route. Aligning them is the
+> single largest latency win available and needs no code change.
 
 Required environment variables (all backend-only, never sent to the frontend):
 
@@ -98,7 +107,9 @@ Required environment variables (all backend-only, never sent to the frontend):
 | `MAX_UPLOAD_MB` | optional per-image upload cap (default `4`; Vercel rejects request bodies over 4.5 MB) |
 | `GROQ_API_KEY`, `AI_*` | Live AI Help (admin panel can override) |
 | `SMTP_*` | transactional mail defaults — the Admin → SMTP panel overrides them once saved |
-| `DB_TIMEOUT_MS`, `DB_BATCH_TIMEOUT_MS`, `DB_BOOTSTRAP_TIMEOUT_MS`, `HEALTH_DB_TIMEOUT_MS`, `SESSION_TIMEOUT_MS`, `REQUEST_TIMEOUT_MS`, `AI_TIMEOUT_MS`, `SMTP_TIMEOUT_MS`, `SSE_MAX_MS` | deadlines — see [Reliability model](#reliability-model-why-no-request-can-hang). All optional; the defaults are tuned for a 10 s function budget |
+| `FUNCTION_MAX_DURATION_MS` | the platform's hard limit for one invocation; **must mirror `maxDuration` in vercel.json** (default `10000`) |
+| `RESPONSE_RESERVE_MS` | time held back from the budget to flush the response (default `500`) |
+| `DB_TIMEOUT_MS`, `DB_BATCH_TIMEOUT_MS`, `DB_BOOTSTRAP_TIMEOUT_MS`, `HEALTH_DB_TIMEOUT_MS`, `SESSION_TIMEOUT_MS`, `REQUEST_TIMEOUT_MS`, `AI_TIMEOUT_MS`, `SMTP_TIMEOUT_MS`, `SSE_MAX_MS` | deadlines — see [Reliability model](#reliability-model-why-no-request-can-hang). All optional, and all **clamped to the invocation budget** at boot (see below) |
 
 Production boot **fails fast** if any required variable is missing
 (`src/config/env.ts`). Set these values in the Vercel project settings for the
@@ -161,8 +172,8 @@ same function at runtime either way.
 
 This section exists because the backend once deployed "successfully" and then
 served nothing: every request spun forever. A green Vercel build says the code
-compiled, not that a request can complete. Two independent defects caused it,
-and both are now structurally impossible.
+compiled, not that a request can complete. Three independent defects caused it,
+and all three are now structurally impossible.
 
 ### 1. The cold start could not fit inside a function invocation
 
@@ -215,9 +226,10 @@ Every blocking primitive is now bounded (`src/db/timeout.ts`):
 | whole cold-start bootstrap | `DB_BOOTSTRAP_TIMEOUT_MS` | `503 DB_NOT_READY`, **work continues in the background** |
 | `/api/health` probe | `HEALTH_DB_TIMEOUT_MS` | `503 database:"unavailable"` |
 | session-store read / write | `SESSION_TIMEOUT_MS` | read fails **open** (caller is logged out); write is best-effort |
-| AI provider call | `AI_TIMEOUT_MS` | `504 AI_TIMEOUT` |
-| SMTP connect / greeting / socket | `SMTP_TIMEOUT_MS` | mail fails, stays in the outbox |
-| any request | `REQUEST_TIMEOUT_MS` | `504 REQUEST_TIMEOUT`, only if nothing was written yet |
+| AI provider call | `AI_TIMEOUT_MS` — **total** for all attempts and backoff, not per attempt | `504 AI_TIMEOUT` |
+| SMTP connect / greeting / socket | `SMTP_TIMEOUT_MS` per phase, plus one bound around the whole send | mail fails, stays in the outbox |
+| outbox flush / maintenance sweep | the remaining invocation budget, checked between items | stops early, reports `skipped` |
+| any request | `REQUEST_TIMEOUT_MS`, and always inside the invocation budget | `504 REQUEST_TIMEOUT`, only if nothing was written yet |
 | SSE stream lifetime | `SSE_MAX_MS` | stream ends cleanly before the platform kills it |
 
 Two details that matter:
@@ -230,6 +242,75 @@ Two details that matter:
 - A failed bootstrap is **backed off** for 5 s. Without that, every request
   arriving during an outage restarted the bootstrap and waited out the full
   deadline — measured as six consecutive 5 s waits where six 2 ms answers belong.
+
+### 3. Every deadline was longer than the invocation it protected
+
+Sections 1 and 2 bounded each *operation*. That is necessary but not sufficient,
+and the gap between the two is what produced
+
+```
+504: GATEWAY_TIMEOUT
+Code: FUNCTION_INVOCATION_TIMEOUT
+```
+
+Vercel kills an invocation at `maxDuration` — **10 s** here. Three of the
+configured deadlines were longer than that, and two handlers *multiplied* them:
+
+| Path | Worst case before | Platform limit |
+| --- | --- | --- |
+| `POST /api/ai/chat` | `AI_TIMEOUT_MS` 25 s **per attempt** x 2 attempts + 0.4 s backoff = **50.4 s** | 10 s |
+| `POST /api/admin/mail/flush` | up to 50 sequential sends x ~24 s (nodemailer applies `connectionTimeout`, `greetingTimeout` **and** `socketTimeout` in sequence) | 10 s |
+| `POST /api/admin/maintenance` | the flush above + 6 prune tasks, sequentially | 10 s |
+| the outer failsafe itself | `REQUEST_TIMEOUT_MS` = 55 s — it could therefore **never fire** | 10 s |
+
+Measured, not estimated: with a provider that never answers, `POST /api/ai/chat`
+held the socket for **50 424 ms** before returning its own JSON 504. Vercel had
+killed it at 10 000 ms.
+
+**Why the frontend spun forever.** When the platform kills an invocation it
+answers with its own **HTML** error page, not this app's JSON envelope. A frontend
+doing `const data = await res.json()` throws on HTML; if the spinner is cleared in
+the success path or in a `catch` that re-throws, it never clears. The user sees an
+infinite loader and the network tab shows `504: GATEWAY_TIMEOUT`.
+
+**The fix is not a bigger timeout.** It is one budget that everything spends down:
+
+- `vercel.json` pins `maxDuration: 10`; `FUNCTION_MAX_DURATION_MS` mirrors it and
+  `npm run test:budget` fails if the two disagree.
+  `budget = FUNCTION_MAX_DURATION_MS - RESPONSE_RESERVE_MS` (10 000 - 500).
+- **Every deadline is clamped to that budget at boot** (`src/config/env.ts`) and
+  the clamp is logged at `warn`, so an operator who sets `AI_TIMEOUT_MS=25000`
+  sees it reduced rather than debugging a value that silently does not apply.
+- **Every deadline is re-clamped per call to the time actually left** in the
+  current request (`src/utils/deadline.ts`, an `AsyncLocalStorage` deadline
+  established by `middleware/requestTimeout.ts`). `withTimeout()` and the libSQL
+  `timedFetch()` both do this, so no caller can forget. Outside a request —
+  `npm run db:init`, `src/dev.ts` — the remaining budget is infinite and nothing
+  is truncated.
+- `AI_TIMEOUT_MS` is now the **total** for the interaction. Each attempt is handed
+  whatever is left, an attempt too short to be worth starting is skipped, and a
+  tail is reserved to persist the turn and write the response.
+- The AI `fetch` timer now covers the **body**, not just the headers. `await
+  fetch()` resolves when the response head arrives; clearing the timer there (as
+  the helper did) left `res.text()` / `res.json()` with no deadline at all, so a
+  provider that sent headers and then stalled still hung the request.
+- The mail flush and the maintenance sweep check the budget **between** items and
+  stop early, reporting `skipped` / `stopped:"budget"`. Unclaimed mail stays
+  queued for the next run, so nothing is lost.
+- The outer failsafe fires at `REQUEST_TIMEOUT_MS + grace` where the grace is
+  smaller than the response reserve — so it always lands inside the platform
+  limit, and the client always receives *our* JSON 504 with `retryable: true`
+  instead of Vercel's HTML one. Per-operation deadlines fire first, so the client
+  normally gets the specific reason (`AI_TIMEOUT`, `DB_TIMEOUT`) and only sees the
+  generic `REQUEST_TIMEOUT` if a handler swallowed it.
+- `errorHandler` and `notFoundHandler` now refuse to write when headers are
+  already sent. Once the failsafe has answered, the handler is still running and
+  its eventual `res.json()` would throw `ERR_HTTP_HEADERS_SENT` *inside the error
+  handler* — the one place Express has nothing left to catch it with.
+
+Same stalled provider after the fix, at a deliberately small 6 s budget:
+**4 916 ms → `504 {"error":{"code":"AI_TIMEOUT","retryable":true}}`**, and the
+responsive path still returns `200` with the reply intact.
 
 ### Nothing optional is initialized at startup
 
@@ -577,7 +658,16 @@ frontend (dmoshiur/lspk) calls, verified end-to-end by `npm run test:contract`.
 | 422 | `UNPROCESSABLE` |
 | 429 | `RATE_LIMITED`, `RESET_THROTTLED` (with `Retry-After`) |
 | 500 | `INTERNAL` (body stays generic in production; details logged) |
-| 502/503/504 | `AI_UPSTREAM_ERROR`, `AI_NOT_CONFIGURED`, `AI_TIMEOUT`, `AI_EMPTY_RESPONSE`, `DB_NOT_READY` |
+| 502/503/504 | `AI_UPSTREAM_ERROR`, `AI_NOT_CONFIGURED`, `AI_TIMEOUT`, `AI_EMPTY_RESPONSE`, `DB_NOT_READY`, `DB_TIMEOUT`, `SESSION_STORE_TIMEOUT`, `SMTP_TIMEOUT`, `REQUEST_TIMEOUT`, `FUNCTION_BUDGET_EXHAUSTED` |
+
+**Every response the backend produces is JSON, including every failure.** That is
+a contract the frontend depends on, not a nicety: a `504` from *this app* arrives
+as `{ error: { code, message, retryable } }` and can be parsed, shown and retried,
+whereas a `504` from the *platform* arrives as an HTML page that makes
+`await res.json()` throw. The budget model above exists so that the platform never
+gets to answer first. On the client, still clear the loading state in a `finally`
+(and guard the `res.json()` parse), so that an unreachable backend degrades to an
+error message instead of an endless spinner.
 
 Checkout rejections use **400 with a distinct `code`** on purpose: the frontend
 renders a 400 as a "warning" flash the shopper can act on (change the quantity,
@@ -592,11 +682,12 @@ machine-readable part (e.g. `{product_id, requested, available}`).
 | `npm run dev` | local server (tsx, same app as prod) |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run build` | compile to `dist/` |
-| `npm run test` | every suite below, in order (deploy → e2e → AI → contract → v3) |
+| `npm run test` | every suite below, in order (deploy → budget → e2e → AI → contract → v3) |
 | `npm run test:contract` | end-to-end **contract** suite — the endpoints the shipped frontend calls (spawns the app on port 4100 with a throwaway DB) |
 | `npm run test:v3` | end-to-end **v3 feature** suite — reset/verify flows, dashboard, notifications, ledger, strict pricing, RBAC, navigation, chat idempotency, rate limits (port 4200) |
 | `npm run test:ai` | unit tests for AI output sanitization (incl. streamed reasoning tags split across chunks) |
 | `npm run test:deploy` | deployment **and hang-prevention** guard: `vercel.json` shape, entry exports, "only `dev.ts` listens", session store, every deadline, batched bootstrap, probe independence, documented env vars |
+| `npm run test:budget` | **invocation-budget** guard: `vercel.json maxDuration` ↔ `FUNCTION_MAX_DURATION_MS` agree, every deadline is clamped to the budget, retry loops spend down one total deadline, loops check the budget between items — then boots the real serverless entry at a small budget against a provider that never answers and requires a JSON response before the platform would kill it |
 | `npm run test:e2e` | production-path end-to-end suite against the real serverless entry (`api/index.ts`), `NODE_ENV=production`, hard deadline per request |
 | `npm run bench:coldstart` | cold-start latency vs Turso RTT; exits non-zero if any first request exceeds the platform budget |
 | `npm run db:init` | apply schema + seeds (idempotent) |
@@ -606,13 +697,14 @@ machine-readable part (e.g. `{product_id, requested, available}`).
 ## Verification
 
 ```bash
-npm run typecheck && npm run build && npm test     # 469 checks, exit 0 only when all pass
+npm run typecheck && npm run build && npm test     # 544 checks, exit 0 only when all pass
 npm run bench:coldstart                            # must stay inside the 10 s function budget
 ```
 
 | Suite | Checks | What it covers |
 | --- | --- | --- |
 | `test:deploy` | 79 | `vercel.json` shape (no legacy `routes`, one rewrite, no non-entrypoint functions), default-exported handler, nothing but `dev.ts` listens, Turso session store, documented env vars — **plus** the hang-prevention invariants: transport deadline injected into libSQL, every query/batch/transaction step bounded, `applySchema()` batched rather than one request per statement, bootstrap memoized + backed off + skippable when warm, health/session/bootstrap probes independent of the database, request failsafe mounted first, AI/SMTP/SSE deadlines, no MemoryStore |
+| `test:budget` | 75 | the invocation budget: `vercel.json maxDuration` and `FUNCTION_MAX_DURATION_MS` agree and are Hobby-legal, the budget leaves a response reserve, every one of the nine deadline knobs is clamped to it, clamps are logged rather than silent, the deadline is request-scoped (`AsyncLocalStorage`) and unbounded outside a request, `withTimeout`/`timedFetch` re-clamp per call, the AI loop spends down ONE total deadline and reserves a tail for persistence, the AI fetch timer covers the body and can never hand `Infinity` to `setTimeout`, the mail flush and maintenance sweep check the budget between items and report what they skipped, error handlers refuse to write twice — **then boots the real serverless entry at a 6 s budget against a provider that never answers and requires a parseable JSON 504 before the platform would kill it, plus a 200 on the responsive path**, and a route that ignores every deadline entirely must still be answered with a parseable, retryable JSON 504 inside the limit |
 | `test:e2e` | 65 | the production path itself: imports `api/index.ts` and drives it over a platform-owned socket in `NODE_ENV=production` with a hard per-request deadline (a hang is a failure). Liveness, health envelope, CORS allow + reject, register/login/logout, bearer and cookie auth, secure-cookie emission behind the forwarded-proto edge, user dashboard, admin dashboard, RBAC denial for a normal user, server-authoritative order pricing, payment ledger + admin confirm, chat idempotency by `client_message_id`, SSE self-termination, controlled AI failure, 404/400 envelopes, warm-path latency |
 | `test:ai` | 31 | reasoning-block removal (paired / unterminated / stray / case-insensitive / every tag name), provider `reasoning*` fields never read, streamed tags split across chunks, clean text untouched |
 | `test:contract` | 125 | the contract the shipped frontend calls: health/meta, auth incl. first-account super-admin + token rotation/revocation, profile self-service, shop (catalogue → cart → checkout → admin lifecycle → owner-cancel with restock → double-cancel 409), blood requests, support inbox, review moderation, live chat, AI (503 when unconfigured), uploads, every admin route |

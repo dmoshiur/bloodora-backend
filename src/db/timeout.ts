@@ -24,6 +24,8 @@
  * into a *shaped, fast* error (503 + a stable `code`) rather than a stall.
  */
 
+import { clampToRemaining } from "../utils/deadline.js";
+
 /** An operation that gave up waiting. Shaped so the central error handler turns it into 503 JSON. */
 export class TimeoutError extends Error {
   readonly status = 503;
@@ -31,8 +33,13 @@ export class TimeoutError extends Error {
   readonly waitedMs: number;
   readonly operation: string;
 
-  constructor(operation: string, ms: number, code = "DB_TIMEOUT") {
-    super(`${operation} timed out after ${ms}ms`);
+  /**
+   * `messageOverride` exists for the "no budget left at all" case: reporting
+   * "timed out after 5000ms" when the invocation had 0ms remaining would send an
+   * operator looking at the wrong number.
+   */
+  constructor(operation: string, ms: number, code = "DB_TIMEOUT", messageOverride?: string) {
+    super(messageOverride ?? `${operation} timed out after ${ms}ms`);
     this.name = "TimeoutError";
     this.code = code;
     this.waitedMs = ms;
@@ -64,8 +71,22 @@ export function isTimeoutError(err: unknown): boolean {
  */
 export function withTimeout<T>(p: Promise<T>, ms: number, operation: string, code?: string): Promise<T> {
   if (!Number.isFinite(ms) || ms <= 0) return p; // 0/negative disables the bound
+  // Clamp to the time actually left in this invocation. `ms` is a *configured*
+  // ceiling; the request budget is the *real* one. Without this, ten individually
+  // bounded calls could still sum past the platform's limit and the function
+  // would be killed before any of them reported anything.
+  // Outside a request (CLIs, dev boot) remainingMs() is Infinity and this is a
+  // no-op, so long-running local work is never truncated.
+  const effective = clampToRemaining(ms);
+  if (effective <= 0) {
+    // Nothing left: fail immediately with the same shaped error the timer would
+    // have produced, rather than racing a platform kill.
+    return Promise.reject(
+      new TimeoutError(operation, 0, code, `${operation} was not attempted — this invocation has no time budget left`),
+    );
+  }
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new TimeoutError(operation, ms, code)), ms);
+    const timer = setTimeout(() => reject(new TimeoutError(operation, effective, code)), effective);
     timer.unref?.();
     p.then(
       (value) => {
@@ -95,8 +116,18 @@ export function timedFetch(ms: number, operation = "database request"): typeof g
   return async function timedFetchImpl(input: FetchInput, init?: FetchInit) {
     if (!Number.isFinite(ms) || ms <= 0) return base(input, init);
 
+    // The client (and therefore this closure) is created ONCE per instance and
+    // shared by every request, so the configured `ms` cannot be baked in as the
+    // effective deadline — it is re-clamped per call against whatever is left of
+    // the current request's budget. This is what stops a database round trip
+    // started 9 s into a 10 s invocation from being the thing that runs past it.
+    const effective = clampToRemaining(ms);
+    if (effective <= 0) {
+      throw new TimeoutError(operation, 0, "DB_TIMEOUT", `${operation} was not attempted — this invocation has no time budget left`);
+    }
+
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), ms);
+    const timer = setTimeout(() => controller.abort(), effective);
     timer.unref?.();
 
     // Chain onto a caller-supplied signal so an outer deadline still wins.
@@ -110,7 +141,7 @@ export function timedFetch(ms: number, operation = "database request"): typeof g
       return await base(input as never, { ...(init as object), signal: controller.signal } as never);
     } catch (err) {
       if ((err as Error)?.name === "AbortError" && !outer?.aborted) {
-        throw new TimeoutError(operation, ms);
+        throw new TimeoutError(operation, effective);
       }
       throw err;
     } finally {

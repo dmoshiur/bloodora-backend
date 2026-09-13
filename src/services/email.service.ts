@@ -6,6 +6,8 @@ import { userRepo } from "../repos/user.repo.js";
 import { translate, LANGUAGE_META, normalizeLang, type Lang } from "../i18n/index.js";
 import { logger } from "../utils/logger.js";
 import { maskEmail } from "../utils/errors.js";
+import { config } from "../config/env.js";
+import { budgetExhausted } from "../utils/deadline.js";
 
 /**
  * Transactional email: localized templates + a durable outbox.
@@ -69,6 +71,33 @@ export function layout({ lang, title, paragraphs, cta, table, footerNote }: Layo
   </div>`;
 }
 
+/** Result of one outbox flush. `skipped`/`stopped` are additive, never removed. */
+export interface FlushResult {
+  attempted: number;
+  sent: number;
+  failed: number;
+  remaining: number;
+  /** Rows still queued because the invocation ran out of time, not because they failed. */
+  skipped: number;
+  /** `"budget"` when the loop stopped early to answer in time; otherwise null. */
+  stopped: "budget" | null;
+}
+
+/** Time one send may need; below this the flush stops instead of starting it. */
+const MIN_SEND_BUDGET_MS = Math.max(1_000, config.smtpTimeoutMs);
+
+/**
+ * Final tally. It runs AFTER the sends, so the budget may already be gone — a
+ * missing count must not turn a successful flush into a 504.
+ */
+async function safeCounts(): Promise<{ pending: number; sent: number; failed: number }> {
+  try {
+    return await outboxRepo.counts();
+  } catch {
+    return { pending: 0, sent: 0, failed: 0 };
+  }
+}
+
 export const emailService = {
   /**
    * Deliver one message. Never throws: mail is a side effect, and a broken SMTP
@@ -101,27 +130,53 @@ export const emailService = {
     }
   },
 
-  /** Retry everything the outbox still owes. Returns a summary. */
-  async flush(limit = 10): Promise<{ attempted: number; sent: number; failed: number; remaining: number }> {
+  /**
+   * Retry everything the outbox still owes. Returns a summary.
+   *
+   * This loop is bounded by the INVOCATION, not just by each send. It used to run
+   * up to 50 sequential `sendMail()` calls in one request, each allowed ~24 s by
+   * nodemailer's three stacked phase timeouts — hundreds of seconds inside a
+   * function the platform kills at 10 s, i.e. a guaranteed
+   * `FUNCTION_INVOCATION_TIMEOUT`. It now stops between messages when the budget
+   * runs low; unclaimed rows stay queued and the next flush (or cron) picks them
+   * up, so nothing is lost and `skipped` says how much was left.
+   */
+  async flush(limit = 10): Promise<FlushResult> {
     const settings = await resolveSmtpSettings();
     if (!settings.enabled || !settings.host) {
-      return { attempted: 0, sent: 0, failed: 0, remaining: (await outboxRepo.counts()).pending };
+      return { attempted: 0, sent: 0, failed: 0, remaining: (await safeCounts()).pending, skipped: 0, stopped: null };
     }
     const rows = await outboxRepo.claimNext(limit);
     let sent = 0;
     let failed = 0;
+    let attempted = 0;
+    let stopped: FlushResult["stopped"] = null;
+
     for (const row of rows) {
+      // Check BEFORE starting a send: a message we cannot finish would only burn
+      // the time the response still needs. One send can legitimately take the
+      // whole per-phase budget, so require that much before starting another.
+      if (budgetExhausted(MIN_SEND_BUDGET_MS)) {
+        stopped = "budget";
+        logger.warn("email: outbox flush stopped early — invocation budget nearly exhausted", {
+          attempted,
+          queued: rows.length,
+        });
+        break;
+      }
+      attempted += 1;
       try {
         await smtpService.sendMail(row.to_email, row.subject, row.html, row.text ?? undefined);
         await outboxRepo.markSent(row.id);
         sent += 1;
       } catch (err) {
-        await outboxRepo.markFailed(row.id, (err as Error)?.message || String(err));
+        await outboxRepo.markFailed(row.id, (err as Error)?.message || String(err)).catch(() => {});
         failed += 1;
       }
     }
-    const counts = await outboxRepo.counts();
-    return { attempted: rows.length, sent, failed, remaining: counts.pending };
+
+    const counts = await safeCounts();
+    return { attempted, sent, failed, remaining: counts.pending, skipped: rows.length - attempted, stopped };
   },
 
   async stats() {

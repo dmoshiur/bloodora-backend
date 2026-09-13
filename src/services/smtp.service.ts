@@ -6,6 +6,8 @@ import { userRepo } from "../repos/user.repo.js";
 import { config } from "../config/env.js";
 import { logger } from "../utils/logger.js";
 import { maskEmail } from "../utils/errors.js";
+import { withTimeout } from "../db/timeout.js";
+import { budgetExhausted } from "../utils/deadline.js";
 
 export interface SmtpSettings {
   enabled: boolean;
@@ -57,6 +59,20 @@ function transporterFor(s: SmtpSettings): nodemailer.Transporter {
   return transporter;
 }
 
+/**
+ * Bound one whole send.
+ *
+ * nodemailer's `connectionTimeout`, `greetingTimeout` and `socketTimeout` are
+ * three SEQUENTIAL phases, so a per-phase value of 8 s was really up to 24 s for a
+ * single message — and `email.service.flush()` sends up to 50 of them in a loop
+ * inside one invocation. With the per-phase value now clamped to a third of the
+ * function budget (see `config/env.ts`), this bounds the sum as well, and
+ * `withTimeout` clamps it further to whatever the current request has left.
+ */
+function sendTimeoutMs(): number {
+  return config.smtpTimeoutMs * 3;
+}
+
 export const smtpService = {
   async sendMail(to: string, subject: string, html: string, text?: string): Promise<void> {
     const s = await resolveSmtpSettings();
@@ -64,13 +80,18 @@ export const smtpService = {
       logger.info("smtp: disabled — skipping mail (log only)", { to: maskEmail(to), subject });
       return;
     }
-    await transporterFor(s).sendMail({
-      from: `"${s.fromName}" <${s.fromEmail}>`,
-      to,
-      subject,
-      html,
-      text: text || undefined,
-    });
+    await withTimeout(
+      transporterFor(s).sendMail({
+        from: `"${s.fromName}" <${s.fromEmail}>`,
+        to,
+        subject,
+        html,
+        text: text || undefined,
+      }),
+      sendTimeoutMs(),
+      "SMTP send",
+      "SMTP_TIMEOUT",
+    );
     logger.info("smtp: mail sent", { to: maskEmail(to), subject });
   },
 
@@ -103,14 +124,31 @@ export const smtpService = {
       </div>`;
     try {
       const transporter = transporterFor(s);
-      await (transporter as nodemailer.Transporter & { verify?: () => Promise<unknown> }).verify?.();
-      const info = await transporter.sendMail({
-        from: `"${s.fromName || "BloodOra"} <${s.fromEmail || s.user}>"`,
-        to,
-        subject,
-        text,
-        html,
-      });
+      // verify() opens its own connection, so it gets its own bound; the two
+      // phases together must still fit inside the invocation.
+      await withTimeout(
+        Promise.resolve((transporter as nodemailer.Transporter & { verify?: () => Promise<unknown> }).verify?.()),
+        sendTimeoutMs(),
+        "SMTP verify",
+        "SMTP_TIMEOUT",
+      );
+      if (budgetExhausted(500)) {
+        const message = "SMTP connect succeeded, but the request ran out of time before the message could be sent. Try again.";
+        await contentRepo.logEmail(to, "SMTP test", "failed", message).catch(() => {});
+        return { sent: false, message: `⚠️ ${message}`, error: message };
+      }
+      const info = await withTimeout(
+        transporter.sendMail({
+          from: `"${s.fromName || "BloodOra"} <${s.fromEmail || s.user}>"`,
+          to,
+          subject,
+          text,
+          html,
+        }),
+        sendTimeoutMs(),
+        "SMTP send",
+        "SMTP_TIMEOUT",
+      );
       await contentRepo.logEmail(to, "SMTP test", "sent", null);
       return { sent: true, message: `✅ Test email sent to ${to}. Check the inbox (and spam folder).`, info };
     } catch (e) {
