@@ -125,8 +125,8 @@ curl -i https://YOUR_PUBLIC_BACKEND_DOMAIN/
 # 200: {"name":"bloodora-backend","status":"ok",...}
 
 curl -i https://YOUR_PUBLIC_BACKEND_DOMAIN/api/health
-# 200 {"success":true,"status":"ok","database":"connected","db":"ok",...}
-# 503 {"success":false,"status":"degraded","database":"unavailable","db":"error","dbError":"…"}
+# 200 {"ok":true,"success":true,"status":"ok","database":"connected","db":"ok","dbMs":38,"breaker":"closed",...}
+# 503 {"ok":false,"success":false,"status":"degraded","database":"unavailable","db":"error","reason":"timeout","breaker":"open",...}
 ```
 
 `/api/health` is **guaranteed to answer**: it is exempt from the session
@@ -135,6 +135,21 @@ middleware, the bootstrap middleware and the language middleware, and its own
 produces a 503 in about 1.5 s, never an endless spinner. `database` is the
 explicit dependency verdict; `db` is the legacy alias the contract suite and the
 frontend proxy still read.
+
+Two more fields make the probe actionable instead of merely red:
+
+- `reason` — why the database is unusable, as a leak-free category
+  (`timeout`, `unreachable`, `server_error`, `rate_limited`, `auth_rejected`,
+  `not_configured`, `closed`). `auth_rejected` means the Turso token is wrong;
+  `timeout` means the host never answered. The technical detail (which can name
+  the host) is logged server-side and never returned.
+- `breaker` — the circuit-breaker state (`closed` / `open` / `half-open`), i.e.
+  whether data routes are currently failing fast. The probe itself bypasses the
+  breaker, so it keeps telling the truth while the breaker is open, and a
+  successful probe is what closes it again.
+
+`dbMs` is the probe's own round-trip time; compare it with `budgetMs`/`answerByMs`
+(both echoed) to see how much of the invocation a healthy request has left.
 
 `/` and `/health` only check that the function is reachable. `/api/health` also
 performs a live database query. If curl returns a Vercel login page or a 401
@@ -312,6 +327,87 @@ Same stalled provider after the fix, at a deliberately small 6 s budget:
 **4 916 ms → `504 {"error":{"code":"AI_TIMEOUT","retryable":true}}`**, and the
 responsive path still returns `200` with the reply intact.
 
+### 4. The budget was spent without leaving anything for the caller
+
+Sections 1–3 made every deadline fit inside *this* function. That is still not
+enough, because this API is almost never the last hop:
+
+```
+browser → frontend Vercel function (SSR, maxDuration 10s)
+        → POST /api/ai/chat on THIS function (maxDuration 10s)
+        → Groq
+```
+
+Both hops run on the same 10 s clock and the outer one *waits* for the inner one.
+An inner hop that answers at 9.5 s leaves the outer hop nothing to render and
+flush with, so Vercel kills it and answers the browser with an **HTML**
+`504 FUNCTION_INVOCATION_TIMEOUT`. The frontend's `await res.json()` throws on
+HTML, its error path had no timeout and no `finally`, and the user saw a spinner
+that never stopped plus a "server crashed" page — while this backend's logs said
+`[BOOT] database: ready` and showed no failing request at all, because the
+request had succeeded.
+
+`UPSTREAM_RESERVE_MS` (default 1500, capped at a third of the budget so it can
+never starve the work it protects) is held back for whoever is calling us:
+
+```
+answerByMs = FUNCTION_MAX_DURATION_MS - RESPONSE_RESERVE_MS - UPSTREAM_RESERVE_MS
+           = 10000 - 500 - 1500 = 8000
+```
+
+`REQUEST_TIMEOUT_MS`, `AI_TIMEOUT_MS` and `SSE_MAX_MS` are clamped to
+`answerByMs`, not to the whole budget. Measured with `npm run test:budget` at a
+6 s budget: a provider that never answers now yields
+**3 412 ms → 504 AI_TIMEOUT** where it previously took 4 916 ms — inside the
+caller's own deadline instead of consuming it. `AI_TIMEOUT_MS` also dropped from
+25 000 (per attempt!) to a 6 000 ms *total* default, because two attempts plus
+post-processing have to fit in the space that is actually left.
+
+### 5. A database outage was reported as a bug in this application
+
+With Turso unreachable, every data route answered
+
+```
+500 {"error":{"code":"INTERNAL","message":"Something went wrong. Please try again."}}
+```
+
+after burning the **full 5 006 ms** per statement. Two separate defects:
+
+**(a) The wrong status, and the wrong owner.** `500 INTERNAL` says "this code has
+a bug", so an operator is sent looking at the application instead of at Turso's
+status page — and to the frontend it is indistinguishable from a real crash,
+which is how "the database blipped" became "the server crashed". `src/db/errors.ts`
+now separates *dependency* failures from *SQL* failures and shapes the former as
+`503 DB_UNAVAILABLE` / `DB_AUTH_FAILED` / `DB_NOT_CONFIGURED` with `retryable`
+and `Retry-After`.
+
+The distinction cannot be made from `err.code` alone. Measured against the real
+Hrana-over-HTTP transport (`npm run test:remote`):
+
+| Situation | What actually arrives |
+| --- | --- |
+| `UNIQUE` violation | `LibsqlError{code:"UNKNOWN", message:"UNKNOWN: SQLITE_CONSTRAINT_UNIQUE: …"}` |
+| Turso answers 500 | `LibsqlError{code:"SERVER_ERROR", message:"Server returned HTTP status 500"}` |
+| Turso rejects the token (401) | `LibsqlError{code:"UNKNOWN", message:"UNKNOWN: invalid token"}` |
+
+So SQL errors are recognised by the `SQLITE_*` marker in the *message* (and are
+never remapped — `EMAIL_TAKEN` must keep meaning 409), while the HTTP status is
+classified in `timedFetch`, the one layer that can still see it. Without that,
+the third row above is a `500 INTERNAL` that reads as "the server crashed" when
+the truth is "the Turso token is wrong".
+
+Provenance matters in the other direction too: this API's *own* auth errors say
+`Unauthorized` and `jwt malformed`, so a message heuristic applied to any error
+turned a correct `401` into `503 DB_AUTH_FAILED`. The heuristics are therefore
+gated on `isDriverError()` — error class, transport status, or our own shaping.
+
+**(b) Every request paid for the outage again.** `src/db/breaker.ts` counts
+consecutive transport failures and, after `DB_BREAKER_THRESHOLD` (3), refuses new
+work immediately: same 503, same honest reason, in **2–8 ms** instead of 5 006 ms.
+Exactly one trial is admitted per cooldown window (2 s, doubling to a 10 s cap),
+so recovery needs no redeploy — measured: data routes answer 200 again on the
+*same instance* the moment Turso does. SQL errors never trip it.
+
 ### Nothing optional is initialized at startup
 
 `createApp()` opens no connection and touches no network: the app is built in
@@ -328,8 +424,30 @@ distinguishable from "the function is up and its database is not".
 
 ```bash
 npm run test:e2e         # 65 checks against the REAL serverless entry, NODE_ENV=production
+npm run test:remote      # 56 checks against the REAL Hrana-over-HTTP transport
 npm run bench:coldstart  # cold-start latency vs Turso RTT; exits 1 if any exceeds the budget
 ```
+
+`test:remote` exists because of a hole in every other suite: they point
+`TURSO_DATABASE_URL` at a `file:` URL, so `@libsql/client` uses its **local
+engine** and never touches the network. Latency, TLS, HTTP status codes, socket
+resets, auth rejection and the 20-round-trip cold start — none of it is
+exercised, which is exactly why a backend that passed 500+ local checks could
+still fail in production. It speaks the real Hrana v2 protocol to
+`tests/turso-stub.mts` (a libSQL-backed HTTP stub with injectable latency,
+failures and token requirements) and measures round trips, not guesses:
+
+| Measurement | Result |
+| --- | --- |
+| Cold start, empty DB, RTT 60 / 150 / 250 ms | 1 408 / 3 201 / 5 198 ms — 20 round trips |
+| Warm start, same RTTs | 506 / 1 132 / 1 833 ms — 7 round trips |
+| Hot-path round trips (`health`, `meta/settings`, `shop/products`) | 1 each |
+| `auth/me` (session + user + role) | 4 |
+| DB silent: `/api/health` | 503 in 1 502 ms |
+| DB silent: data route | 503 `DB_TIMEOUT` in 5 005 ms |
+| DB answers 500 / drops the socket: data route | 503 `DB_UNAVAILABLE` in **8 ms / 2 ms** (breaker) |
+| Rejected Turso token | 503 `DB_AUTH_FAILED`, `retryable:false`, then 4 ms |
+| Recovery on the same instance | 200 again, no redeploy, no crash markers |
 
 `test:e2e` imports `api/index.ts` — the file Vercel actually runs — and drives
 it over a platform-owned socket with a hard deadline on every request, so a hang
@@ -658,16 +776,32 @@ frontend (dmoshiur/lspk) calls, verified end-to-end by `npm run test:contract`.
 | 422 | `UNPROCESSABLE` |
 | 429 | `RATE_LIMITED`, `RESET_THROTTLED` (with `Retry-After`) |
 | 500 | `INTERNAL` (body stays generic in production; details logged) |
-| 502/503/504 | `AI_UPSTREAM_ERROR`, `AI_NOT_CONFIGURED`, `AI_TIMEOUT`, `AI_EMPTY_RESPONSE`, `DB_NOT_READY`, `DB_TIMEOUT`, `SESSION_STORE_TIMEOUT`, `SMTP_TIMEOUT`, `REQUEST_TIMEOUT`, `FUNCTION_BUDGET_EXHAUSTED` |
+| 502/503/504 | `AI_UPSTREAM_ERROR`, `AI_NOT_CONFIGURED`, `AI_TIMEOUT`, `AI_EMPTY_RESPONSE`, `DB_NOT_READY`, `DB_TIMEOUT`, `DB_UNAVAILABLE`, `DB_AUTH_FAILED`, `DB_NOT_CONFIGURED`, `SESSION_STORE_TIMEOUT`, `SMTP_TIMEOUT`, `REQUEST_TIMEOUT`, `FUNCTION_BUDGET_EXHAUSTED` |
+
+Every 503/504 in that last row carries `retryable` and a `Retry-After` header,
+with one deliberate exception: `DB_AUTH_FAILED` and `DB_NOT_CONFIGURED` are
+`retryable: false` and send no `Retry-After`, because a client cannot fix a wrong
+Turso token by asking again — an honest "do not retry" is what stops a
+misconfigured deployment from being hammered forever by well-behaved clients.
 
 **Every response the backend produces is JSON, including every failure.** That is
 a contract the frontend depends on, not a nicety: a `504` from *this app* arrives
-as `{ error: { code, message, retryable } }` and can be parsed, shown and retried,
-whereas a `504` from the *platform* arrives as an HTML page that makes
-`await res.json()` throw. The budget model above exists so that the platform never
-gets to answer first. On the client, still clear the loading state in a `finally`
-(and guard the `res.json()` parse), so that an unreachable backend degrades to an
-error message instead of an endless spinner.
+as `{ ok:false, error: { code, message, retryable }, requestId }` and can be
+parsed, shown and retried, whereas a `504` from the *platform* arrives as an HTML
+page that makes `await res.json()` throw. The budget model above exists so that the
+platform never gets to answer first. On the client, still clear the loading state
+in a `finally` (and guard the `res.json()` parse), so that an unreachable backend
+degrades to an error message instead of an endless spinner.
+
+Every response also carries `ok` (a single boolean to branch on, added centrally by
+`src/middleware/envelope.ts`) and a `requestId` — echoed as the `X-Request-Id`
+header and logged on the `[API] request`/`[API] response` lines, so one user's
+complaint maps to one log line. **[`docs/frontend-integration.md`](docs/frontend-integration.md)
+is the caller-side contract**: how to read the envelope, which codes are retryable
+and which mean "an operator must act", how to size a client timeout from
+`answerByMs`, and a verified patch for the `dmoshiur/lspk` frontend
+(`docs/lspk-frontend.patch`) that adds the deadline, the retry rules and the Retry
+affordance this section asks for.
 
 Checkout rejections use **400 with a distinct `code`** on purpose: the frontend
 renders a 400 as a "warning" flash the shopper can act on (change the quantity,
@@ -682,13 +816,14 @@ machine-readable part (e.g. `{product_id, requested, available}`).
 | `npm run dev` | local server (tsx, same app as prod) |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run build` | compile to `dist/` |
-| `npm run test` | every suite below, in order (deploy → budget → e2e → AI → contract → v3) |
+| `npm run test` | every suite below, in order (deploy → budget → e2e → remote → AI → contract → v3) |
 | `npm run test:contract` | end-to-end **contract** suite — the endpoints the shipped frontend calls (spawns the app on port 4100 with a throwaway DB) |
 | `npm run test:v3` | end-to-end **v3 feature** suite — reset/verify flows, dashboard, notifications, ledger, strict pricing, RBAC, navigation, chat idempotency, rate limits (port 4200) |
 | `npm run test:ai` | unit tests for AI output sanitization (incl. streamed reasoning tags split across chunks) |
 | `npm run test:deploy` | deployment **and hang-prevention** guard: `vercel.json` shape, entry exports, "only `dev.ts` listens", session store, every deadline, batched bootstrap, probe independence, documented env vars |
 | `npm run test:budget` | **invocation-budget** guard: `vercel.json maxDuration` ↔ `FUNCTION_MAX_DURATION_MS` agree, every deadline is clamped to the budget, retry loops spend down one total deadline, loops check the budget between items — then boots the real serverless entry at a small budget against a provider that never answers and requires a JSON response before the platform would kill it |
 | `npm run test:e2e` | production-path end-to-end suite against the real serverless entry (`api/index.ts`), `NODE_ENV=production`, hard deadline per request |
+| `npm run test:remote` | **remote-transport** suite: the real Hrana-over-HTTP protocol against `tests/turso-stub.mts`, with injectable latency, 500s, socket drops and token rejection — cold/warm-start round-trip counts, failure classification, breaker timing and same-instance recovery |
 | `npm run bench:coldstart` | cold-start latency vs Turso RTT; exits non-zero if any first request exceeds the platform budget |
 | `npm run db:init` | apply schema + seeds (idempotent) |
 | `npm run db:backup` | dump tables to `data/backup-*.json` (dev) |
@@ -697,15 +832,16 @@ machine-readable part (e.g. `{product_id, requested, available}`).
 ## Verification
 
 ```bash
-npm run typecheck && npm run build && npm test     # 544 checks, exit 0 only when all pass
+npm run typecheck && npm run build && npm test     # 663 checks, exit 0 only when all pass
 npm run bench:coldstart                            # must stay inside the 10 s function budget
 ```
 
 | Suite | Checks | What it covers |
 | --- | --- | --- |
-| `test:deploy` | 79 | `vercel.json` shape (no legacy `routes`, one rewrite, no non-entrypoint functions), default-exported handler, nothing but `dev.ts` listens, Turso session store, documented env vars — **plus** the hang-prevention invariants: transport deadline injected into libSQL, every query/batch/transaction step bounded, `applySchema()` batched rather than one request per statement, bootstrap memoized + backed off + skippable when warm, health/session/bootstrap probes independent of the database, request failsafe mounted first, AI/SMTP/SSE deadlines, no MemoryStore |
-| `test:budget` | 75 | the invocation budget: `vercel.json maxDuration` and `FUNCTION_MAX_DURATION_MS` agree and are Hobby-legal, the budget leaves a response reserve, every one of the nine deadline knobs is clamped to it, clamps are logged rather than silent, the deadline is request-scoped (`AsyncLocalStorage`) and unbounded outside a request, `withTimeout`/`timedFetch` re-clamp per call, the AI loop spends down ONE total deadline and reserves a tail for persistence, the AI fetch timer covers the body and can never hand `Infinity` to `setTimeout`, the mail flush and maintenance sweep check the budget between items and report what they skipped, error handlers refuse to write twice — **then boots the real serverless entry at a 6 s budget against a provider that never answers and requires a parseable JSON 504 before the platform would kill it, plus a 200 on the responsive path**, and a route that ignores every deadline entirely must still be answered with a parseable, retryable JSON 504 inside the limit |
+| `test:deploy` | 129 | `vercel.json` shape (no legacy `routes`, one rewrite, no non-entrypoint functions), default-exported handler, nothing but `dev.ts` listens, Turso session store, documented env vars — **plus** the hang-prevention invariants: transport deadline injected into libSQL, every query/batch/transaction step bounded, `applySchema()` batched rather than one request per statement, bootstrap memoized + backed off + skippable when warm, health/session/bootstrap probes independent of the database, request failsafe mounted first, AI/SMTP/SSE deadlines, no MemoryStore — **plus** the dependency-failure invariants: one guarded choke point (breaker gate → deadline → classification) with no call bypassing it, the breaker opens on consecutive transport failures and closes itself on the next success, SQL errors are never remapped, message heuristics apply only to driver-produced errors, the transport classifies its own HTTP status, request IDs and the `ok` envelope are mounted before any handler, failures carry `requestId` + `Retry-After`, request/response lines are INFO-level so production logs show them, no `url.parse()` in our sources (DEP0169), engines pinned to Node 22 |
+| `test:budget` | 88 | the invocation budget: `vercel.json maxDuration` and `FUNCTION_MAX_DURATION_MS` agree and are Hobby-legal, the budget leaves a response reserve, every one of the nine deadline knobs is clamped to it, clamps are logged rather than silent, the deadline is request-scoped (`AsyncLocalStorage`) and unbounded outside a request, `withTimeout`/`timedFetch` re-clamp per call, the AI loop spends down ONE total deadline and reserves a tail for persistence, the AI fetch timer covers the body and can never hand `Infinity` to `setTimeout`, the mail flush and maintenance sweep check the budget between items and report what they skipped, error handlers refuse to write twice, the budget holds back `UPSTREAM_RESERVE_MS` for the function that called us and clamps the request/AI/SSE deadlines to `answerByMs` rather than to the whole invocation — **then boots the real serverless entry at a 6 s budget against a provider that never answers and requires a parseable JSON 504 before the platform would kill it, plus a 200 on the responsive path**, and a route that ignores every deadline entirely must still be answered with a parseable, retryable JSON 504 inside the limit |
 | `test:e2e` | 65 | the production path itself: imports `api/index.ts` and drives it over a platform-owned socket in `NODE_ENV=production` with a hard per-request deadline (a hang is a failure). Liveness, health envelope, CORS allow + reject, register/login/logout, bearer and cookie auth, secure-cookie emission behind the forwarded-proto edge, user dashboard, admin dashboard, RBAC denial for a normal user, server-authoritative order pricing, payment ledger + admin confirm, chat idempotency by `client_message_id`, SSE self-termination, controlled AI failure, 404/400 envelopes, warm-path latency |
+| `test:remote` | 56 | the **remote transport** the other suites cannot reach (`file:` URLs use libSQL's local engine and never touch a socket): speaks Hrana v2 over HTTP to `tests/turso-stub.mts`, counts round trips for cold start (20) and warm start (7) at 60/150/250 ms RTT and asserts every first request still fits the 10 s invocation, accounts the hot path (`health`/`settings`/`products` = 1 round trip, `auth/me` = 4), proves a session cookie adds none, then injects failure — silence, HTTP 500, socket drop, rejected token — and requires fast parseable JSON with the right status, a stable leak-free code and no host/token/SQL in the body, plus recovery on the SAME instance with no crash markers. Also round-trips register/login/bearer auth, a multi-statement order write with server-side pricing and stock, and a BLOB upload served back byte-for-byte |
 | `test:ai` | 31 | reasoning-block removal (paired / unterminated / stray / case-insensitive / every tag name), provider `reasoning*` fields never read, streamed tags split across chunks, clean text untouched |
 | `test:contract` | 125 | the contract the shipped frontend calls: health/meta, auth incl. first-account super-admin + token rotation/revocation, profile self-service, shop (catalogue → cart → checkout → admin lifecycle → owner-cancel with restock → double-cancel 409), blood requests, support inbox, review moderation, live chat, AI (503 when unconfigured), uploads, every admin route |
 | `test:v3` | 169 | everything added on top: health envelope, backend i18n (`?lang=`, `Accept-Language`, saved preference), forgot/reset password and email verification **driven end-to-end by reading the link out of the mail outbox**, personal dashboard, notifications (feed, badges, read/read-all/delete, per-account isolation, channel opt-out), payment ledger (idempotent confirm, single refund, cancelled-order guards), server-authoritative pricing (client prices ignored, stock enforced, delivery fee from settings, restock exactly once), RBAC (seeded roles, custom role, denials, self-lockout/self-demote guards, audit trail), navigation CRUD/ordering/visibility, chat idempotency, shared rate limiting with `Retry-After`, activity SSE cursor |

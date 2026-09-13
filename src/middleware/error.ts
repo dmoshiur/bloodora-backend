@@ -2,6 +2,9 @@ import type { Request, Response, NextFunction } from "express";
 import { ApiError } from "../utils/errors.js";
 import { config } from "../config/env.js";
 import { logger } from "../utils/logger.js";
+import { classifyDbError, isDbDependencyError, isDriverError } from "../db/errors.js";
+import { breakerRetryAfterSeconds } from "../db/breaker.js";
+import { requestIdOf } from "./requestId.js";
 
 interface ShapedError {
   status?: number;
@@ -10,12 +13,57 @@ interface ShapedError {
   details?: unknown;
   issues?: Array<{ field: string; message: string }>;
   type?: string;
+  retryable?: boolean;
+  retryAfterMs?: number;
 }
 
 /** 404 for anything that fell through the routers. */
-export function notFoundHandler(_req: Request, res: Response): void {
+export function notFoundHandler(req: Request, res: Response): void {
   if (res.headersSent) return;
-  res.status(404).json({ error: { code: "NOT_FOUND", message: "Not found" } });
+  res.status(404).json(envelope(req, res, 404, "NOT_FOUND", "Not found"));
+}
+
+/**
+ * The one response shape every failure in this API returns.
+ *
+ *   {
+ *     ok: false,                       // a client can branch without knowing codes
+ *     success: false,                  // the field this API's success bodies use
+ *     error: { code, message, … },     // the original nested envelope (unchanged)
+ *     code, message,                   // flat twins of the two above
+ *     requestId                        // quote this in a support conversation
+ *   }
+ *
+ * Why both nested AND flat? The nested `error.code` is this backend's contract and
+ * its own test suites read it. The flat `message` is what the deployed frontend
+ * actually displays: its API client does `data.message || "Request failed (500)"`,
+ * so before the flat twin existed every backend error surfaced in the UI as the
+ * generic "Request failed (500)" — a database outage and a validation error looked
+ * identical, and neither said what to do. Adding fields is backwards compatible;
+ * changing `error` from an object to a string would not have been.
+ *
+ * `requestId` is echoed on every failure so a user's complaint can be tied to one
+ * line in the Vercel log stream.
+ */
+function envelope(
+  req: Request,
+  res: Response,
+  status: number,
+  code: string,
+  message: string,
+  extra?: Record<string, unknown>,
+): Record<string, unknown> {
+  const requestId = requestIdOf(req);
+  if (requestId !== "-" && !res.getHeader("X-Request-Id")) res.setHeader("X-Request-Id", requestId);
+  return {
+    ok: false,
+    success: false,
+    error: { code, message, ...(extra ?? {}) },
+    code,
+    message,
+    ...(extra ?? {}),
+    requestId,
+  };
 }
 
 /**
@@ -33,9 +81,23 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     logger.warn("error after the response was already sent — dropping", {
       path: req.originalUrl,
       method: req.method,
+      requestId: requestIdOf(req),
       err: err instanceof Error ? err.message : String(err),
     });
     return;
+  }
+
+  // Safety net for the classification that normally happens in `src/db/query.ts`:
+  // a database call made OUTSIDE that choke point (a future repo using the client
+  // directly, a session-store helper, a migration CLI wired into a route) must
+  // still not surface as a 500 "we have a bug" when Turso is simply down.
+  if (
+    !(err instanceof ApiError) &&
+    (err as { status?: number })?.status === undefined &&
+    isDriverError(err) &&
+    isDbDependencyError(err)
+  ) {
+    err = classifyDbError(err, `${req.method} ${req.originalUrl.split("?")[0]}`);
   }
 
   let status = 500;
@@ -80,23 +142,47 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     logger.error("unhandled error", {
       path: req.originalUrl,
       method: req.method,
+      requestId: requestIdOf(req),
+      code,
       err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
     });
   } else if (status >= 500) {
-    logger.warn("service unavailable", { path: req.originalUrl, method: req.method, status, code, message });
+    logger.warn("service unavailable", { path: req.originalUrl, method: req.method, requestId: requestIdOf(req), status, code, message });
   } else if (status === 401 || status === 403) {
-    logger.warn("auth rejection", { path: req.originalUrl, status, code });
+    logger.warn("auth rejection", { path: req.originalUrl, requestId: requestIdOf(req), status, code });
   }
 
-  const errorObj: Record<string, unknown> = { code, message };
-  if (details !== undefined) errorObj.details = details;
-  if (issues) errorObj.issues = issues;
-  // A 504 we produced means the invocation ran out of time. Say so explicitly and
-  // tell the client it is safe to retry, so a frontend can clear its spinner and
-  // offer a retry instead of waiting on a response that will never come.
-  if (status === 504) {
-    errorObj.retryable = true;
-    res.setHeader("Retry-After", "1");
+  const shaped = (err ?? {}) as ShapedError;
+  const extra: Record<string, unknown> = {};
+  if (details !== undefined) extra.details = details;
+  if (issues) extra.issues = issues;
+
+  // A 504 we produced means the invocation ran out of time, and a 503 means a
+  // dependency did. Both are usually transient: say so explicitly (`retryable`)
+  // and back it with `Retry-After`, so a client clears its spinner and offers a
+  // retry instead of waiting on a response that will never come — or hammering us
+  // while the database is still down.
+  //
+  // The exception is a dependency failure that retrying CANNOT fix: rejected
+  // credentials (`DB_AUTH_FAILED`) or a deployment with no database configured
+  // (`DB_NOT_CONFIGURED`). Those are operator problems. Marking them retryable
+  // makes a well-behaved client loop on a request that will fail identically for
+  // as long as the misconfiguration stands — an outage that never ends and never
+  // surfaces a reason. The shaped error says so with `retryable: false`, and that
+  // answer wins over the status-code default below.
+  const transientDbFailure = status === 503 && code.startsWith("DB_");
+  const retryable =
+    shaped.retryable === false ? false : status === 504 || shaped.retryable === true || transientDbFailure;
+  if (retryable) {
+    extra.retryable = true;
+    const seconds = transientDbFailure
+      ? breakerRetryAfterSeconds()
+      : Math.max(1, Math.ceil((shaped.retryAfterMs ?? 1_000) / 1_000));
+    res.setHeader("Retry-After", String(seconds));
+  } else if (transientDbFailure) {
+    // Still tell the client the retry is pointless rather than leaving it guessing.
+    extra.retryable = false;
   }
-  res.status(status).json({ error: errorObj });
+
+  res.status(status).json(envelope(req, res, status, code, message, extra));
 }

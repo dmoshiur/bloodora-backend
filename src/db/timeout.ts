@@ -25,6 +25,7 @@
  */
 
 import { clampToRemaining } from "../utils/deadline.js";
+import { transportStatusError } from "./errors.js";
 
 /** An operation that gave up waiting. Shaped so the central error handler turns it into 503 JSON. */
 export class TimeoutError extends Error {
@@ -138,7 +139,17 @@ export function timedFetch(ms: number, operation = "database request"): typeof g
     }
 
     try {
-      return await base(input as never, { ...(init as object), signal: controller.signal } as never);
+      const resp = await base(input as never, { ...(init as object), signal: controller.signal } as never);
+      // A non-2xx from the database service is classified HERE, at the only layer
+      // that can still see the real HTTP status. Above us hrana flattens it:
+      // `401 {"message":"invalid token"}` becomes an error with `code:"UNKNOWN"`,
+      // no status, and no hint that a credential is wrong — which used to reach
+      // the browser as a 500 INTERNAL and read as "the server crashed".
+      if (!resp.ok) {
+        const detail = await readBodyBriefly(resp);
+        throw transportStatusError(resp.status, operation, detail);
+      }
+      return resp;
     } catch (err) {
       if ((err as Error)?.name === "AbortError" && !outer?.aborted) {
         throw new TimeoutError(operation, effective);
@@ -148,6 +159,35 @@ export function timedFetch(ms: number, operation = "database request"): typeof g
       clearTimeout(timer);
     }
   } as unknown as typeof globalThis.fetch;
+}
+
+/**
+ * Read a failed response body for the LOG only, with its own short leash.
+ *
+ * The abort timer has already been cleared by the time we look at the body, so a
+ * server that streams nothing would otherwise hang this throw. Never rejects: a
+ * diagnostic must not be able to change the answer.
+ */
+async function readBodyBriefly(resp: Response, limit = 300, ms = 400): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const text = await new Promise<string>((resolve) => {
+      timer = setTimeout(() => {
+        void resp.body?.cancel().catch(() => {});
+        resolve("");
+      }, ms);
+      timer.unref?.();
+      resp
+        .text()
+        .then((body) => resolve(body))
+        .catch(() => resolve(""));
+    });
+    return text.replace(/\s+/g, " ").trim().slice(0, limit);
+  } catch {
+    return "";
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**

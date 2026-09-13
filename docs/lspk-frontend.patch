@@ -1,0 +1,358 @@
+diff --git a/src/api.js b/src/api.js
+index c18e670..4753768 100644
+--- a/src/api.js
++++ b/src/api.js
+@@ -7,11 +7,48 @@ dotenv.config();
+ 
+ export const BACKEND_URL = (process.env.BACKEND_URL || "http://localhost:4000").replace(/\/+$/, "");
+ 
++/**
++ * Hard client-side deadline for ONE backend call, in ms.
++ *
++ * This frontend renders its pages inside its own Vercel function, on the same
++ * 10 s clock as the backend it calls. Without a deadline here, a slow backend
++ * call is not "a slow request" — it is this function being killed mid-render,
++ * after which the platform answers the browser with an HTML
++ * `504 FUNCTION_INVOCATION_TIMEOUT` that no `res.json()` can parse. That is what
++ * reached users as a "server crashed" page plus a spinner that never stopped.
++ *
++ * The backend now answers within `answerByMs` (8 s by default: 10 s invocation
++ * minus its response reserve minus `UPSTREAM_RESERVE_MS`, which it holds back
++ * precisely so THIS function can still render and flush). 9 s therefore leaves
++ * room for the backend's own JSON 504 to arrive — with its `code` and
++ * `requestId` — instead of us inventing an error. Never raise this above your
++ * own function's maxDuration minus ~1 s of render time.
++ */
++export const REQUEST_TIMEOUT_MS = Number(process.env.BACKEND_TIMEOUT_MS || 9000);
++
+ export class ApiError extends Error {
+   constructor(message, status = 0, data = null) {
+     super(message);
+     this.status = status;
+     this.data = data;
++    // Lift the machine-readable parts of the failure onto the error itself, so a
++    // caller can branch on `err.code` / `err.retryable` without knowing whether
++    // the failure came from the backend's envelope or from our own deadline.
++    // `data` is the parsed response body for an HTTP error, and a small meta
++    // object ({code, retryable}) for a failure we constructed locally.
++    const src = (data && typeof data === "object" ? data : {}) || {};
++    const body = (src.error && typeof src.error === "object" ? src.error : {}) || {};
++    const retryable = typeof body.retryable === "boolean" ? body.retryable
++      : typeof src.retryable === "boolean" ? src.retryable
++      : status >= 500 || status === 0;
++    /** Stable machine code: DB_AUTH_FAILED, BACKEND_TIMEOUT, EMAIL_TAKEN, … */
++    this.code = src.code || body.code || null;
++    /** Whether asking again could possibly succeed. False = an operator must act. */
++    this.retryable = retryable;
++    /** Correlates with one line in the backend log; safe to show a user. */
++    this.requestId = src.requestId || null;
++    /** From the Retry-After header, when the backend sent one. */
++    this.retryAfterMs = 0;
+   }
+ }
+ 
+@@ -20,7 +57,7 @@ export class ApiError extends Error {
+  * @param {string} path  e.g. "/api/auth/login"
+  * @param {object} opts  { method, token, json, formData, query }
+  */
+-export async function apiRequest(path, { method = "GET", token = null, json = null, formData = null, query = null } = {}) {
++export async function apiRequest(path, { method = "GET", token = null, json = null, formData = null, query = null, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+   let url = BACKEND_URL + path;
+   if (query && typeof query === "object") {
+     const qs = new URLSearchParams(
+@@ -40,14 +77,33 @@ export async function apiRequest(path, { method = "GET", token = null, json = nu
+     init.body = JSON.stringify(json);
+   }
+ 
++  // Bound the call. `AbortController` is what actually releases the socket; a
++  // timer that only stops us *waiting* would leave the function holding a
++  // connection it can no longer use.
++  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
++  const timer = controller && timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
++  if (timer && typeof timer.unref === "function") timer.unref();
++  if (controller) init.signal = controller.signal;
++
+   let res;
+   try {
+     res = await fetch(url, init);
+   } catch (e) {
++    if (e && e.name === "AbortError") {
++      // Our deadline, not a network fault. Retryable, and worth saying so
++      // explicitly so the UI can offer a Retry instead of a dead end.
++      throw new ApiError(`⚠️ The backend did not answer within ${timeoutMs}ms.`, 0, {
++        code: "BACKEND_TIMEOUT",
++        retryable: true,
++      });
++    }
+     throw new ApiError(
+       `⚠️ Cannot reach the backend API at ${BACKEND_URL}. Check the BACKEND_URL environment variable.`,
+-      0
++      0,
++      { code: "BACKEND_UNREACHABLE", retryable: true }
+     );
++  } finally {
++    if (timer) clearTimeout(timer);
+   }
+ 
+   let data = null;
+@@ -58,10 +114,21 @@ export async function apiRequest(path, { method = "GET", token = null, json = nu
+     throw new ApiError(`⚠️ Backend returned a non-JSON response (${res.status}).`, res.status);
+   }
+ 
+-  if (!res.ok || (data && data.success === false)) {
+-    const msg = (data && data.message) || `Request failed (${res.status})`;
++  if (!res.ok || (data && (data.success === false || data.ok === false))) {
++    // The backend sends a stable envelope: `{ ok:false, error:{code,message},
++    // code, message, requestId }`. Branch on `code`, never on the message text —
++    // messages are localized (en/bn/ar) and are written for humans.
++    const errBody = (data && data.error) || {};
++    const msg = (data && data.message) || errBody.message || `Request failed (${res.status})`;
+     const err = new ApiError(msg, res.status, data);
+     err.type = data && data.type;
++    err.code = (data && data.code) || errBody.code || null;
++    err.retryable = typeof errBody.retryable === "boolean" ? errBody.retryable : res.status >= 500;
++    // Quoting this in a support message is what turns "it broke" into a log line
++    // somebody can actually find.
++    err.requestId = (data && data.requestId) || res.headers.get("x-request-id") || null;
++    const retryAfter = Number(res.headers.get("retry-after") || 0);
++    err.retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 0;
+     throw err;
+   }
+   return data;
+@@ -71,8 +138,8 @@ export async function apiRequest(path, { method = "GET", token = null, json = nu
+ export const apiGet = (path, token = null, query = null) =>
+   apiRequest(path, { method: "GET", token, query });
+ 
+-export const apiPost = (path, json = null, token = null) =>
+-  apiRequest(path, { method: "POST", json, token });
++export const apiPost = (path, json = null, token = null, timeoutMs = REQUEST_TIMEOUT_MS) =>
++  apiRequest(path, { method: "POST", json, token, timeoutMs });
+ 
+ export const apiPut = (path, json = null, token = null) =>
+   apiRequest(path, { method: "PUT", json, token });
+@@ -110,7 +177,21 @@ export function buildFormData(fields = {}, file = null, fileField = "file") {
+ export async function proxyEventStream(req, res, backendPath) {
+   let upstream;
+   try {
+-    upstream = await fetch(BACKEND_URL + backendPath, { headers: { Accept: "text/event-stream" } });
++    // Only the CONNECT is bounded: the stream itself must stay open until the
++    // backend ends it (it self-terminates inside SSE_MAX_MS, clamped to the same
++    // caller-safe budget). Aborting the stream mid-flight would look like a
++    // network fault to the browser.
++    const connect = typeof AbortController !== "undefined" ? new AbortController() : null;
++    const connectTimer = connect ? setTimeout(() => connect.abort(), REQUEST_TIMEOUT_MS) : null;
++    if (connectTimer && typeof connectTimer.unref === "function") connectTimer.unref();
++    try {
++      upstream = await fetch(BACKEND_URL + backendPath, {
++        headers: { Accept: "text/event-stream" },
++        signal: connect ? connect.signal : undefined,
++      });
++    } finally {
++      if (connectTimer) clearTimeout(connectTimer);
++    }
+   } catch (e) {
+     if (!res.headersSent) res.status(502).end();
+     return;
+diff --git a/src/routes/ai.js b/src/routes/ai.js
+index 100b5dc..20daf5c 100644
+--- a/src/routes/ai.js
++++ b/src/routes/ai.js
+@@ -2,12 +2,30 @@
+ // Same-origin proxy for the widget plus the admin configuration routes.
+ import express from "express";
+ import { createRequire } from "module";
+-import { apiGet, apiPost } from "../api.js";
++import { apiGet, apiPost, REQUEST_TIMEOUT_MS } from "../api.js";
+ import { requireAdmin } from "../middleware/auth.js";
+ import { invalidateBranding } from "../middleware/site.js";
+ 
+ const router = express.Router();
+ 
++/**
++ * Budget arithmetic for this proxy hop.
++ *
++ *   our function limit      10 000 ms  (vercel.json / Vercel project settings)
++ *   - render + flush reserve  1 000 ms  (RENDER_RESERVE_MS)
++ *   = AI_PROXY_BUDGET_MS      9 000 ms  for every attempt COMBINED
++ *
++ * The backend holds back `UPSTREAM_RESERVE_MS` (1500 by default) so that it
++ * answers by ~8 s; that reserve is what makes the arithmetic above possible
++ * instead of a race. If you raise this function's maxDuration, raise
++ * AI_PROXY_BUDGET_MS with it — and if you raise the backend's, remember the
++ * browser is waiting on the SUM of both hops.
++ */
++const RENDER_RESERVE_MS = Number(process.env.AI_RENDER_RESERVE_MS || 1000);
++const AI_PROXY_BUDGET_MS = Number(process.env.AI_PROXY_BUDGET_MS || 9000);
++/** Below this, an attempt cannot finish in time, so do not start one. */
++const MIN_ATTEMPT_MS = 1500;
++
+ // Single source of truth for reasoning removal: the same UMD module the
+ // browser loads (/js/chat-utils.js). Stripping here means internal reasoning
+ // never even leaves this server — the client-side strip is defence-in-depth.
+@@ -52,15 +70,39 @@ router.post("/chat", async (req, res) => {
+ 
+   let lastError = null;
+   const maxRetries = 2;
++  // ONE deadline shared by every attempt, not one timeout per attempt.
++  //
++  // This route is itself a Vercel function on a 10 s clock, and the backend call
++  // inside it can legitimately take up to ~8 s. Two retries with per-call
++  // timeouts and no shared deadline is how the OUTER function gets killed while
++  // it is still waiting: the browser then receives Vercel's HTML 504 — a body no
++  // `res.json()` can parse — which the UI can only render as "the server
++  // crashed", with the spinner left running because no response ever arrived to
++  // clear it. Retrying has to fit inside the time we actually have.
++  const deadline = Date.now() + AI_PROXY_BUDGET_MS;
++  const timeLeft = () => deadline - Date.now();
+ 
+   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+     try {
+       if (attempt > 0) {
+-        // Exponential backoff: 500ms, 1200ms
+-        await new Promise((r) => setTimeout(r, attempt * 600));
++        // Exponential backoff: 500ms, 1200ms — but only if an attempt can still
++        // finish afterwards. A retry that cannot complete is just a slower
++        // version of the failure we already know about.
++        const backoff = attempt * 600;
++        if (backoff + MIN_ATTEMPT_MS > timeLeft()) break;
++        await new Promise((r) => setTimeout(r, backoff));
+       }
+ 
+-      const d = await apiPost("/api/ai/chat", payload, req.session?.token || null);
++      const remaining = timeLeft();
++      if (remaining < MIN_ATTEMPT_MS) break;
++
++      const d = await apiPost(
++        "/api/ai/chat",
++        payload,
++        req.session?.token || null,
++        // Never wait longer than this function can afford to.
++        Math.min(REQUEST_TIMEOUT_MS, remaining - RENDER_RESERVE_MS),
++      );
+ 
+       // SECURITY: never forward model reasoning (<think>…</think>) to the browser
+       let cleanReply = "";
+@@ -77,14 +119,20 @@ router.post("/chat", async (req, res) => {
+     } catch (e) {
+       lastError = e;
+       const status = e.status || 0;
+-      if (status === 429 && attempt < maxRetries) {
++      // `retryable: false` means an operator has to change something — the
++      // backend sends it for DB_AUTH_FAILED and DB_NOT_CONFIGURED. Looping on
++      // those cannot succeed and only burns the budget the browser is waiting on.
++      if (e.retryable === false) break;
++      if ((status === 429 || status >= 500 || status === 0) && attempt < maxRetries) {
+         continue;
+       }
+       break;
+     }
+   }
+ 
+-  const status = lastError?.status || 502;
++  // Never answered at all (we ran out of budget before an attempt could finish):
++  // say "timeout", not "unavailable" — a 504 is retryable, a 502 reads as broken.
++  const status = lastError?.status || (lastError ? 502 : 504);
+   const t = typeof req.t === "function" ? req.t : (k) => k;
+   let clientMessage = t("errors_ai_unavailable");
+ 
+@@ -92,11 +140,21 @@ router.post("/chat", async (req, res) => {
+     clientMessage = t("errors_ai_rate_limit");
+   } else if (status === 408 || status === 504) {
+     clientMessage = t("errors_ai_timeout");
++  } else if (lastError?.code === "DB_AUTH_FAILED" || lastError?.code === "DB_NOT_CONFIGURED") {
++    // An operator problem, not something the visitor can retry away.
++    clientMessage = t("errors_ai_unavailable");
+   }
+ 
++  // Forward the machine-readable parts of the backend's answer. The widget can
++  // then offer a Retry only when retrying could help, and quote a requestId that
++  // maps to one line in the backend log.
+   return res.status(status >= 400 && status < 600 ? status : 502).json({
++    ok: false,
+     success: false,
+     status,
++    code: lastError?.code || null,
++    requestId: lastError?.requestId || null,
++    retryable: lastError?.retryable !== false,
+     message: clientMessage,
+   });
+ });
+diff --git a/views/partials/footer.ejs b/views/partials/footer.ejs
+index 25f90ab..5834b68 100644
+--- a/views/partials/footer.ejs
++++ b/views/partials/footer.ejs
+@@ -232,6 +232,48 @@
+     function aiSay(text, cls){ if (aiBody) aiBody.appendChild(bubble(cls || 'msg-bot', cls === 'msg-bot' ? mdAi(text) : md(text))); aiScroll(); }
+     function aiScroll(){ if (aiPanel) { var b = aiPanel.querySelector('.widget-body'); if (b) b.scrollTop = b.scrollHeight; } }
+ 
++    // A failure bubble that says what to do next.
++    //
++    // The Retry button appears ONLY when retrying could succeed. The backend
++    // marks operator problems — `DB_AUTH_FAILED`, `DB_NOT_CONFIGURED` — as
++    // `retryable:false`, and offering a retry there just gives the visitor a
++    // button that fails identically forever. When a retry IS offered it re-sends
++    // the last message through the same path (aiSend(1)), so it is a real action,
++    // not a decorative one. The requestId is shown because it maps to exactly one
++    // line in the backend log: "it broke" becomes something an operator can find.
++    function aiError(d){
++      if (!aiBody) return;
++      var msg = (d && d.message) || I18N.unavailable;
++      if (d && d.status === 429) msg = I18N.rateLimit;
++      var node = bubble('msg-bot', md('⚠️ ' + msg));
++      var canRetry = !d || d.retryable !== false;
++      var bar = document.createElement('div');
++      bar.className = 'd-flex gap-2 mt-2 align-items-center';
++      bar.style.cssText = 'opacity:.75;';
++      if (canRetry) {
++        var retryBtn = document.createElement('button');
++        retryBtn.type = 'button'; retryBtn.className = 'btn btn-sm btn-light border';
++        retryBtn.style.cssText = 'border-radius:999px; font-size:.68rem; padding:.1rem .55rem;';
++        retryBtn.innerHTML = '<i class="fas fa-rotate-right me-1"></i>' + esc(I18N.retry);
++        retryBtn.onclick = function(){
++          if (aiState.busy) return;
++          if (aiState.lastMessage) { aiInput.value = aiState.lastMessage; aiSend(1); }
++        };
++        bar.appendChild(retryBtn);
++      }
++      if (d && d.requestId) {
++        var ref = document.createElement('span');
++        ref.className = 'text-muted ms-auto';
++        ref.style.cssText = 'font-size:.62rem; font-family:ui-monospace,monospace;';
++        ref.textContent = 'ref ' + String(d.requestId).slice(0, 16);
++        ref.title = String(d.requestId);
++        bar.appendChild(ref);
++      }
++      if (bar.childNodes.length) node.appendChild(bar);
++      aiBody.appendChild(node);
++      aiScroll();
++    }
++
+     // An AI answer bubble with copy + retry affordances (real actions, no fakes).
+     function aiAnswer(text){
+       if (!aiBody) return;
+@@ -327,9 +369,7 @@
+           aiState.conv = d.conversation_id || aiState.conv;
+           aiAnswer(d.reply);
+         } else {
+-          var msg = (d && d.message) || I18N.unavailable;
+-          if (d && d.status === 429) msg = I18N.rateLimit;
+-          aiSay('⚠️ ' + msg, 'msg-bot');
++          aiError(d);
+         }
+       })
+       .catch(function(e){
+@@ -337,9 +377,12 @@
+         if (e && e.name === 'AbortError') {
+           aiSay('⏹ ' + I18N.stopped, 'msg-bot');
+         } else if (!navigator.onLine) {
+-          aiSay('⚠️ ' + I18N.network, 'msg-bot');
++          aiError({ message: I18N.network, retryable: true });
+         } else {
+-          aiSay('⚠️ ' + I18N.unavailable, 'msg-bot');
++          // Includes the case where the platform answered with an HTML 504 page
++          // instead of our JSON: `r.json()` failed, so there is no requestId and
++          // nothing to branch on — but retrying is still the right offer.
++          aiError({ message: I18N.unavailable, retryable: true });
+         }
+       })
+       .finally(function(){

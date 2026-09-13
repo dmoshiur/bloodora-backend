@@ -5,7 +5,7 @@
   "type": "module",
   "description": "BloodOra backend \u2014 Node.js + TypeScript + Express on Turso/libSQL. Serverless-compatible (Vercel Functions).",
   "engines": {
-    "node": ">=18.17"
+    "node": "22.x"
   },
   "scripts": {
     "dev": "tsx src/dev.ts",
@@ -21,8 +21,9 @@
     "test:deploy": "tsx tests/deploy.test.mts",
     "test:budget": "tsx tests/budget.test.mts",
     "test:e2e": "tsx tests/production.e2e.mts",
+    "test:remote": "tsx tests/remote.test.mts",
     "bench:coldstart": "tsx tests/coldstart.bench.mts",
-    "test": "npm run test:deploy && npm run test:budget && npm run test:e2e && npm run test:ai && npm run test:contract && npm run test:v3"
+    "test": "npm run test:deploy && npm run test:budget && npm run test:e2e && npm run test:remote && npm run test:ai && npm run test:contract && npm run test:v3"
   },
   "dependencies": {
     "@libsql/client": "^0.15.15",

@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import { config } from "../config/env.js";
 import { logger } from "../utils/logger.js";
 import { runWithDeadline } from "../utils/deadline.js";
+import { requestIdOf } from "./requestId.js";
 
 /**
  * Two guarantees, in one cheap middleware:
@@ -51,14 +52,21 @@ export function requestTimeout(req: Request, res: Response, next: NextFunction):
   const started = Date.now();
   const path = req.originalUrl.split("?")[0]; // never log query strings
   const streaming = isStreaming(req);
+  const requestId = requestIdOf(req);
 
-  logger.debug("[REQUEST]", { method: req.method, path });
+  // INFO, not debug. Production runs at LOG_LEVEL=info, so a debug-level request
+  // line is invisible exactly where it is needed: the Vercel log stream showed the
+  // boot sequence and then nothing, which made "the backend crashed" and "the
+  // backend answered 200 but the frontend died" indistinguishable. One concise
+  // line per request is the cheapest observability there is.
+  logger.info("[API] request", { method: req.method, path, requestId });
 
-  // Work deadline: operations clamp themselves to this. Falls back to the whole
-  // budget when the failsafe is disabled (REQUEST_TIMEOUT_MS=0), because leaving
-  // a request completely unbounded on a serverless platform is never correct —
-  // the invocation still dies at maxDuration whether or not we acknowledged it.
-  const workDeadlineMs = config.requestTimeoutMs > 0 ? config.requestTimeoutMs : config.budgetMs;
+  // Work deadline: operations clamp themselves to this. Falls back to the
+  // caller-safe point when the failsafe is disabled (REQUEST_TIMEOUT_MS=0),
+  // because leaving a request completely unbounded on a serverless platform is
+  // never correct — the invocation still dies at maxDuration whether or not we
+  // acknowledged it, and the frontend function proxying it dies even sooner.
+  const workDeadlineMs = config.requestTimeoutMs > 0 ? config.requestTimeoutMs : config.answerByMs;
 
   // Grace between "operations have given up" and "we write the generic 504".
   // Small, and it must keep the write comfortably inside maxDuration — that is
@@ -79,6 +87,7 @@ export function requestTimeout(req: Request, res: Response, next: NextFunction):
           method: req.method,
           path,
           ms,
+          requestId,
         });
         return;
       }
@@ -88,21 +97,30 @@ export function requestTimeout(req: Request, res: Response, next: NextFunction):
         path,
         ms,
         limitMs: config.requestTimeoutMs,
+        answerByMs: config.answerByMs,
         platformMaxDurationMs: config.functionMaxDurationMs,
+        requestId,
       });
       // Same envelope every other 504 in this app uses (see middleware/error.ts),
       // including `retryable` and `Retry-After`. This path does not go through the
       // central error handler, so the fields are set here — a frontend that keys
       // off `retryable` to clear its spinner and offer a retry must see the same
-      // shape whichever layer gave up.
+      // shape whichever layer gave up. The flat `message`/`ok` twins are set for
+      // the same reason: the envelope middleware never runs on this path.
+      const message = "The server took too long to handle this request. Please try again.";
       res.setHeader("Retry-After", "1");
       res.status(504).json({
+        ok: false,
+        success: false,
         error: {
           code: "REQUEST_TIMEOUT",
-          message: "The server took too long to handle this request. Please try again.",
+          message,
           retryable: true,
           elapsedMs: ms,
         },
+        code: "REQUEST_TIMEOUT",
+        message,
+        requestId,
       });
     }, config.requestTimeoutMs + graceMs);
     // Must not be the reason a serverless instance stays alive after the
@@ -117,14 +135,16 @@ export function requestTimeout(req: Request, res: Response, next: NextFunction):
     finished = true;
     if (timer) clearTimeout(timer);
     const ms = Date.now() - started;
-    const line = { method: req.method, path, status: res.statusCode, ms, failsafe: answeredByFailsafe };
+    const line = { method: req.method, path, status: res.statusCode, ms, requestId, failsafe: answeredByFailsafe };
     // 5xx that we chose (503 DB not ready, 504 timeout) is a service condition,
-    // not a bug — warn. Anything else at 500+ is worth an error line.
-    if (res.statusCode >= 500 && res.statusCode !== 503) logger.error("[RESPONSE]", line);
-    else if (res.statusCode >= 400) logger.warn("[RESPONSE]", line);
-    else if (ms >= SLOW_MS) logger.warn("[RESPONSE] slow", line);
-    else if (streaming) logger.debug("[RESPONSE] stream ended", line);
-    else logger.debug("[RESPONSE]", line);
+    // not a bug — warn. Anything else at 500+ is worth an error line. A normal
+    // response is INFO: it is the line that proves the invocation answered, and
+    // at debug level production never showed it.
+    if (res.statusCode >= 500 && res.statusCode !== 503) logger.error("[API] response", line);
+    else if (res.statusCode >= 400) logger.warn("[API] response", line);
+    else if (ms >= SLOW_MS) logger.warn("[API] response slow", line);
+    else if (streaming) logger.info("[API] response (stream ended)", line);
+    else logger.info("[API] response", line);
   };
 
   res.once("finish", done);
