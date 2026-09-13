@@ -72,6 +72,21 @@ function createApp(): express.Express {
   app.disable("x-powered-by");
   app.set("trust proxy", 1); // behind Vercel's edge / LBs
 
+  // Platform probes and browser asset requests must never depend on Turso,
+  // sessions, or any other external service. Keep these routes before all
+  // potentially asynchronous middleware so a cold Vercel invocation always
+  // gets a fast response (and favicon probes cannot consume the timeout).
+  const liveness = (_req: express.Request, res: express.Response) => {
+    res.json({
+      name: "bloodora-backend",
+      service: "bloodora-backend",
+      status: "ok",
+      health: "/api/health",
+    });
+  };
+  app.get(["/", "/health"], liveness);
+  app.get(["/favicon.ico", "/favicon.png"], (_req, res) => res.status(204).end());
+
   // Structured HTTP access logs (request line only — no bodies, no cookies).
   app.use(
     morgan("combined", {
@@ -157,19 +172,6 @@ function createApp(): express.Express {
   // Wrapped in ah(): an unhandled async rejection here would crash the whole
   // process (Express 4 does not catch it), which is a hard DoS vector.
   app.use("/uploads", dbReady, express.Router().get("/:file", ah(serveUpload)));
-
-  const liveness = (_req: express.Request, res: express.Response) => {
-    res.json({
-      name: "bloodora-backend",
-      service: "bloodora-backend",
-      status: "ok",
-      health: "/api/health",
-    });
-  };
-  // Keep both URLs useful for a browser tab, curl, and platform probes. This
-  // check means "the process is reachable"; /api/health additionally verifies
-  // the database and returns 503 when the app is not ready for data requests.
-  app.get(["/", "/health"], liveness);
 
   app.use(notFoundHandler);
   app.use(errorHandler);
