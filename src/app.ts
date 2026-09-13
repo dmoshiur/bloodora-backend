@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
-import helmet from "helmet";
+import * as helmetExports from "helmet";
+import type { HelmetOptions } from "helmet";
 import morgan from "morgan";
 import session from "express-session";
 import { config } from "./config/env.js";
@@ -11,6 +12,36 @@ import apiRouter from "./routes/index.js";
 import { serveUpload } from "./controllers/upload.controller.js";
 import { errorHandler, notFoundHandler } from "./middleware/error.js";
 import { ah } from "./utils/async.js";
+
+/**
+ * helmet publishes dual ESM/CJS builds (`index.mjs` + `index.cjs`) whose
+ * declarations expose the middleware only as `export { helmet as default }`.
+ * WHICH declaration a compiler picks depends on its resolution mode:
+ *
+ *   - this repo's tsconfig (`module/moduleResolution: NodeNext`) takes the ESM
+ *     `index.d.mts` → a default import is the callable middleware;
+ *   - a CJS-oriented compile (Vercel's `@vercel/node` function step resolves the
+ *     `require` condition → `index.d.cts`) binds a default import to the whole
+ *     `module.exports` namespace, which is NOT callable:
+ *
+ *       src/app.ts: error TS2349: This expression is not callable.
+ *         Type 'typeof import(".../node_modules/helmet/index")'
+ *         has no call signatures.
+ *
+ * So take the callable member explicitly instead of default-importing it. Both
+ * shapes are the same function at runtime: the ESM build has a real default
+ * export, and the CJS build ends with `module.exports = exports.default;
+ * module.exports.default = module.exports`. Options stay fully typed through
+ * helmet's own `HelmetOptions`.
+ */
+type HelmetMiddleware = (options?: Readonly<HelmetOptions>) => express.RequestHandler;
+const helmet: HelmetMiddleware =
+  (helmetExports as { default?: HelmetMiddleware }).default ?? (helmetExports as unknown as HelmetMiddleware);
+if (typeof helmet !== "function") {
+  // Never reached with a real helmet install; keeps a broken/partial one legible
+  // instead of dying later as "helmet is not a function" inside createApp().
+  throw new Error("helmet: resolved module is not callable (expected a default-exported middleware)");
+}
 
 function createApp(): express.Express {
   const app = express();
