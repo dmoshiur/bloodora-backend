@@ -89,6 +89,16 @@ export const shopService = {
     };
   },
 
+  /** GET /api/shop/categories — live categories (with product counts) for filter chips. */
+  async categories() {
+    const rows = await productRepo.categories();
+    return {
+      success: true,
+      categories: rows.map((r) => r.category),
+      details: rows,
+    };
+  },
+
   /** GET /api/shop/products/:id */
   async productDetail(id: string) {
     const row = await productRepo.findById(id);
@@ -285,6 +295,36 @@ export const shopService = {
         }
       : null;
     return { success: true, order, items: items.map(shapeItem), orderUser: safeUser };
+  },
+
+  /**
+   * POST /api/shop/orders/:id/cancel — the owner cancels an order that has not
+   * entered fulfilment yet. Stock is restored in the same transaction that
+   * flips the status, so a retried/double cancel cannot restock twice. Admins
+   * have their own status endpoint (any state) — this one is user-scoped.
+   */
+  async cancelOwnOrder(user: SafeUser, orderId: string): Promise<{ message: string }> {
+    const row = await orderRepo.findById(orderId);
+    if (!row) throw ApiError.notFound("Order not found.", "ORDER_NOT_FOUND");
+    if (row.user_id !== user.id) {
+      throw ApiError.forbidden("❌ You can only cancel your own orders.", "OWN_ORDERS_ONLY");
+    }
+    if (row.status !== "pending") {
+      throw ApiError.conflict(
+        "⚠️ This order is already being processed — please use Live Messaging to reach support.",
+        "ORDER_NOT_CANCELLABLE",
+      );
+    }
+    const claimed = await orderRepo.cancelByUserTx(orderId);
+    if (!claimed) {
+      throw ApiError.conflict(
+        "⚠️ This order is already being processed — please use Live Messaging to reach support.",
+        "ORDER_NOT_CANCELLABLE",
+      );
+    }
+    await activityRepo.create("order_cancel", user.id, `Order ${orderId} was cancelled by the customer`);
+    logger.info("order: cancelled by user", { order: orderId, user: user.id });
+    return { message: "✅ Order cancelled. Stock has been restored." };
   },
 
   // ---------- admin: products (multipart image) ----------

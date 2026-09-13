@@ -80,6 +80,30 @@ export const orderRepo = {
   },
 
   /**
+   * Atomically cancel a pending order as its owner: the status flip is a
+   * conditional claim (`WHERE status = 'pending'`), so a double-cancel or a
+   * cancel racing an admin status change can never restock twice.
+   * Returns false when the order was not claimable (already processed).
+   */
+  async cancelByUserTx(id: string): Promise<boolean> {
+    return transaction(async (tx: TxExecutor) => {
+      const claim = await tx.run(
+        `UPDATE orders SET status = 'cancelled' WHERE id = ? AND status = 'pending'`,
+        [id],
+      );
+      if (claim.changes === 0) return false;
+      const items = await tx.all<{ product_id: string; qty: number }>(
+        `SELECT product_id, qty FROM order_items WHERE order_id = ?`,
+        [id],
+      );
+      for (const it of items) {
+        await tx.run(`UPDATE products SET stock = stock + ? WHERE id = ?`, [it.qty, it.product_id]);
+      }
+      return true;
+    });
+  },
+
+  /**
    * Atomically place an order: insert order + items and decrement stock in ONE
    * transaction. If any stock check fails the whole transaction rolls back, so
    * ghost orders / negative stock can never persist.
