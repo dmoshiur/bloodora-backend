@@ -5,6 +5,7 @@
 // ephemeral) and pairs with DB-backed storage (Turso/libSQL).
 import type { Request, RequestHandler } from "express";
 import multer from "multer";
+import { config } from "../config/env.js";
 import { ApiError, randomId } from "../utils/errors.js";
 
 /** Normalized in-memory image ready to be stored by uploadService. */
@@ -15,7 +16,7 @@ export type UploadedImage = {
   ext: string;
 };
 
-export const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MB
+export const MAX_UPLOAD_BYTES = config.maxUploadMb * 1024 * 1024;
 
 const EXT_BY_MIME: Record<string, string> = {
   "image/png": "png",
@@ -55,7 +56,7 @@ export { upload };
 function mapMulterError(err: unknown): Error {
   if (err instanceof multer.MulterError) {
     if (err.code === "LIMIT_FILE_SIZE") {
-      return new ApiError(413, "FILE_TOO_LARGE", "File too large (max 5 MB).");
+      return new ApiError(413, "FILE_TOO_LARGE", `File too large (max ${config.maxUploadMb} MB).`);
     }
     if (err.code === "LIMIT_UNEXPECTED_FILE") {
       return ApiError.badRequest("Unexpected file field.", "UNEXPECTED_FILE");
