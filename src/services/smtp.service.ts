@@ -44,6 +44,14 @@ function transporterFor(s: SmtpSettings): nodemailer.Transporter {
     port: s.port,
     secure: s.secure,
     auth: s.user ? { user: s.user, pass: s.pass } : undefined,
+    // Socket deadlines. nodemailer defaults are effectively "wait for the OS",
+    // so a mail host that accepts the TCP connection and then goes silent held
+    // `sendMail()` — and therefore the whole outbox flush, and the
+    // /api/admin/smtp/test request that triggered it — open indefinitely. SMTP is
+    // never allowed to be the reason an unrelated API call stalls.
+    connectionTimeout: config.smtpTimeoutMs,
+    greetingTimeout: config.smtpTimeoutMs,
+    socketTimeout: config.smtpTimeoutMs,
   });
   transporterCache = { key, transporter };
   return transporter;

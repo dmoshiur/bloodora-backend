@@ -6,7 +6,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { ensureDbReady } from "./db/init.js";
+import { bootstrapDatabase } from "./db/init.js";
 import { closeClient } from "./db/client.js";
 import { all, get } from "./db/query.js";
 import { TABLES } from "./db/schema.js";
@@ -16,12 +16,12 @@ async function main(): Promise<void> {
   const command = process.argv[2] || "init";
 
   if (command === "init") {
-    await ensureDbReady();
+    await bootstrapDatabase();
     const users = await get<{ n: number }>(`SELECT COUNT(*) AS n FROM users`);
     const products = await get<{ n: number }>(`SELECT COUNT(*) AS n FROM products`);
     logger.info("db:init: done", { users: users?.n ?? 0, products: products?.n ?? 0 });
   } else if (command === "backup") {
-    await ensureDbReady();
+    await bootstrapDatabase();
     const out: Record<string, unknown[]> = {};
     for (const table of TABLES) {
       out[table] = await all(`SELECT * FROM ${table}`);

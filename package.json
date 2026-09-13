@@ -19,7 +19,9 @@
     "test:v3": "node tests/v3.mjs",
     "test:ai": "tsx tests/aiSanitize.mts",
     "test:deploy": "tsx tests/deploy.test.mts",
-    "test": "npm run test:deploy && npm run test:ai && npm run test:contract && npm run test:v3"
+    "test:e2e": "tsx tests/production.e2e.mts",
+    "bench:coldstart": "tsx tests/coldstart.bench.mts",
+    "test": "npm run test:deploy && npm run test:e2e && npm run test:ai && npm run test:contract && npm run test:v3"
   },
   "dependencies": {
     "@libsql/client": "^0.15.15",

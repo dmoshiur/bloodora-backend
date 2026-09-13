@@ -1,7 +1,9 @@
-import { navigationRepo, parseKeywords, type NavigationRow } from "../repos/navigation.repo.js";
+import { keywordsToString, navigationRepo, parseKeywords, type NavigationRow } from "../repos/navigation.repo.js";
+import { batch } from "../db/query.js";
+import { nowIso } from "../utils/time.js";
 import { auditRepo } from "../repos/audit.repo.js";
 import { siteRoutes } from "../data/content.js";
-import { ApiError } from "../utils/errors.js";
+import { ApiError, randomId } from "../utils/errors.js";
 import { str, toBool } from "../utils/validate.js";
 import { logger } from "../utils/logger.js";
 import type { SafeUser } from "../types.js";
@@ -72,37 +74,64 @@ let pathCache: { map: Map<string, string>; at: number } | null = null;
 
 export const navigationService = {
   /** Seed the table from the built-in catalogue on an empty database. */
+  /**
+   * Seed the navigation catalogue from the built-in array in TWO round trips
+   * (read existing paths, then insert everything missing in one batch).
+   *
+   * It used to be one INSERT per entry — 34 sequential HTTPS requests to Turso on
+   * a cold start, on top of everything else the bootstrap did. `path` is UNIQUE,
+   * so `ON CONFLICT(path) DO NOTHING` keeps the old guarantee that a duplicate in
+   * the source catalogue cannot abort the bootstrap.
+   */
   async ensureSeeded(): Promise<number> {
-    const count = await navigationRepo.count();
-    if (count > 0) return 0;
-    let inserted = 0;
+    const paths = siteRoutes.map((route) => (route as { path: string }).path);
+    if (paths.length === 0) return 0;
+
+    const found = await batch([
+      { sql: `SELECT path FROM navigation WHERE path IN (${paths.map(() => "?").join(",")})`, args: paths },
+    ]);
+    const existing = new Set(
+      ((found[0]?.rows ?? []) as unknown as Array<{ path: string }>).map((r) => r.path),
+    );
+
+    const at = nowIso();
+    const writes: Array<[string, unknown[]]> = [];
     for (const [index, route] of siteRoutes.entries()) {
       const r = route as { path: string; title: string; purpose?: string; keywords?: string[] };
+      if (existing.has(r.path)) continue;
       const isAdmin = r.path.startsWith("/admin") || r.path.startsWith("/shop/admin");
       const isUser = ["/donors/profile/my", "/donors/profile/edit", "/shop/my-orders", "/messages", "/messages/send"].includes(r.path);
-      try {
-        await navigationRepo.create({
-          label: r.title,
-          path: r.path,
-          title: r.title,
-          purpose: r.purpose ?? null,
-          keywords: r.keywords ?? [],
-          area: isAdmin ? "admin" : isUser ? "user" : "public",
-          section: isAdmin ? "admin" : "main",
-          position: index,
-          isActive: true,
-          requiresAuth: isUser || isAdmin,
-          requiresAdmin: isAdmin,
-        });
-        inserted += 1;
-      } catch (err) {
-        // A duplicate path in the source catalogue must not abort the bootstrap.
-        logger.warn("navigation: seed skipped an entry", { path: r.path, err: String((err as Error)?.message ?? err) });
-      }
+      writes.push([
+        `INSERT INTO navigation
+           (id, label, path, title, purpose, keywords, area, section, icon, position, is_active, requires_auth, requires_admin, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(path) DO NOTHING`,
+        [
+          randomId(),
+          r.title.slice(0, 80),
+          r.path,
+          r.title ?? null,
+          r.purpose ?? null,
+          keywordsToString(r.keywords ?? []),
+          isAdmin ? "admin" : isUser ? "user" : "public",
+          isAdmin ? "admin" : "main",
+          null,
+          index,
+          1,
+          isUser || isAdmin ? 1 : 0,
+          isAdmin ? 1 : 0,
+          at,
+          at,
+        ],
+      ]);
     }
-    logger.info("navigation: seeded from the built-in catalogue", { inserted });
-    pathCache = null;
-    return inserted;
+
+    if (writes.length > 0) {
+      await batch(writes);
+      logger.info("navigation: seeded from the built-in catalogue", { inserted: writes.length });
+      pathCache = null;
+    }
+    return writes.length;
   },
 
   /** Public catalogue — the exact shape `GET /api/meta/routes` has always returned. */

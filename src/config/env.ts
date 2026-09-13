@@ -51,6 +51,29 @@ export interface Config {
   tursoDatabaseUrl: string;
   tursoAuthToken: string;
 
+  /**
+   * Deadlines. Every one of these exists because the thing it bounds could
+   * previously block a request *forever* (see src/db/timeout.ts).
+   */
+  /** Per single SQL statement, including its HTTP round trip. */
+  dbTimeoutMs: number;
+  /** Per `client.batch()` — one round trip that may carry many statements/blobs. */
+  dbBatchTimeoutMs: number;
+  /** The whole cold-start bootstrap a request will wait for before getting a 503. */
+  dbBootstrapTimeoutMs: number;
+  /** The `SELECT 1` liveness probe inside GET /api/health. */
+  healthDbTimeoutMs: number;
+  /** Session-store reads/writes — a stalled DB must degrade auth, not hang it. */
+  sessionTimeoutMs: number;
+  /** Outer bound on any single HTTP request (0 disables). */
+  requestTimeoutMs: number;
+  /** AI provider call. Must stay under the platform's function maxDuration. */
+  aiTimeoutMs: number;
+  /** SMTP connect/greeting/socket limits. */
+  smtpTimeoutMs: number;
+  /** How long an SSE stream keeps its function alive before ending gracefully. */
+  sseMaxMs: number;
+
   jwtSecret: string;
   jwtTtlDays: number;
   cookieDomain: string;
@@ -124,6 +147,22 @@ function build(): Config {
     logLevel: env.LOG_LEVEL || "info",
     tursoDatabaseUrl: env.TURSO_DATABASE_URL || "",
     tursoAuthToken: env.TURSO_AUTH_TOKEN || "",
+    // Deadlines — see src/db/timeout.ts for why each one is load-bearing.
+    // A single SQLite statement over HTTPS should land well inside 1 s; 5 s is
+    // already generous and still leaves room inside a 10 s function budget.
+    dbTimeoutMs: Math.max(0, int(env.DB_TIMEOUT_MS, 5_000)),
+    // A batch is ONE round trip but can carry every DDL statement or all 14
+    // seeded PNG blobs (~170 KB), so it gets a much wider bound than a statement.
+    dbBatchTimeoutMs: Math.max(0, int(env.DB_BATCH_TIMEOUT_MS, 20_000)),
+    // Must stay under the platform's function maxDuration, otherwise the runtime
+    // kills the invocation (FUNCTION_INVOCATION_FAILED) instead of us answering.
+    dbBootstrapTimeoutMs: Math.max(0, int(env.DB_BOOTSTRAP_TIMEOUT_MS, 8_000)),
+    healthDbTimeoutMs: Math.max(0, int(env.HEALTH_DB_TIMEOUT_MS, 1_500)),
+    sessionTimeoutMs: Math.max(0, int(env.SESSION_TIMEOUT_MS, 3_000)),
+    requestTimeoutMs: Math.max(0, int(env.REQUEST_TIMEOUT_MS, 55_000)),
+    aiTimeoutMs: Math.max(0, int(env.AI_TIMEOUT_MS, 25_000)),
+    smtpTimeoutMs: Math.max(0, int(env.SMTP_TIMEOUT_MS, 8_000)),
+    sseMaxMs: Math.max(0, int(env.SSE_MAX_MS, 9_000)),
     jwtSecret: env.JWT_SECRET || "",
     jwtTtlDays: int(env.JWT_TTL_DAYS, 7),
     cookieDomain: env.COOKIE_DOMAIN || "",

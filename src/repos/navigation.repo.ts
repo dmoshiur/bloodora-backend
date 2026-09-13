@@ -49,7 +49,7 @@ export interface NewNavigation {
   requiresAdmin?: boolean;
 }
 
-function keywordsToString(v: string[] | string | null | undefined): string | null {
+export function keywordsToString(v: string[] | string | null | undefined): string | null {
   if (Array.isArray(v)) return JSON.stringify(v);
   if (typeof v === "string" && v.trim()) return v.trim();
   return null;

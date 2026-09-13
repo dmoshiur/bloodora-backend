@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
 import { clientMessageId, liveChatService } from "../services/liveChat.service.js";
 import { str } from "../utils/validate.js";
+import { openSse, pollSse } from "../utils/sse.js";
 
 // ---------- visitor side ----------
 
@@ -53,60 +54,26 @@ export function streamSession(req: Request, res: Response): void {
     res.status(400).end();
     return;
   }
-  res.set({
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-  res.flushHeaders?.();
-  res.write("retry: 4000\n\n");
-
+  // Headers, the close flag, the lifetime cap and the interval teardown all live
+  // in openSse/pollSse now — see src/utils/sse.ts for why a serverless stream must
+  // end itself before the platform's maxDuration does.
+  const stream = openSse(req, res, { retryMs: 4000, label: "support:visitor" });
   let cursor = 0;
-  let closed = false;
-  let timer: NodeJS.Timeout | undefined;
-
-  const send = (payload: unknown, event = "message") => {
-    if (closed) return;
-    try {
-      res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
-    } catch {
-      /* connection gone */
-    }
-  };
 
   const tick = async () => {
-    if (closed) return;
-    try {
-      const { messages, closed: isClosed } = await liveChatService.pollSession(key, cursor);
-      for (const m of messages) {
-        cursor = Math.max(cursor, m.id);
-        send({ type: "message", message: m });
-      }
-      if (isClosed) {
-        send({ type: "closed" });
-        finish();
-        return;
-      }
-    } catch {
-      /* transient DB hiccup — keep polling */
+    const { messages, closed: isClosed } = await liveChatService.pollSession(key, cursor);
+    for (const m of messages) {
+      cursor = Math.max(cursor, m.id);
+      stream.write({ type: "message", message: m });
+    }
+    if (isClosed) {
+      stream.write({ type: "closed" });
+      stream.finish("session closed");
     }
   };
 
-  const finish = () => {
-    closed = true;
-    if (timer) clearInterval(timer);
-    try {
-      res.end();
-    } catch {
-      /* already closed */
-    }
-  };
-
-  send({ type: "connected", session_key: key, time: new Date().toISOString() }, "hello");
-  void tick();
-  timer = setInterval(() => void tick(), 2500);
-  req.on("close", finish);
+  stream.write({ type: "connected", session_key: key, time: new Date().toISOString() }, "hello");
+  pollSse(stream, 2500, tick);
 }
 
 // ---------- admin side ----------
@@ -141,56 +108,20 @@ export async function adminClose(req: Request, res: Response): Promise<void> {
  * Polls the DB for sessions whose last_message_at moved past the cursor.
  */
 export function adminStream(req: Request, res: Response): void {
-  res.set({
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-  res.flushHeaders?.();
-  res.write("retry: 4000\n\n");
-
+  const stream = openSse(req, res, { retryMs: 4000, label: "support:admin" });
   let cursor = new Date().toISOString();
-  let closed = false;
-  let timer: NodeJS.Timeout | undefined;
-
-  const send = (payload: unknown, event = "message") => {
-    if (closed) return;
-    try {
-      res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
-    } catch {
-      /* connection gone */
-    }
-  };
 
   const tick = async () => {
-    if (closed) return;
-    try {
-      const changes = await liveChatService.pollAdminActivity(cursor);
-      for (const c of changes) {
-        if (c.closed && !c.message) send({ type: "closed", session_key: c.session_key });
-        else if (c.message) {
-          send({ type: "message", session_key: c.session_key, visitor_name: c.visitor_name, message: c.message });
-        }
+    const changes = await liveChatService.pollAdminActivity(cursor);
+    for (const c of changes) {
+      if (c.closed && !c.message) stream.write({ type: "closed", session_key: c.session_key });
+      else if (c.message) {
+        stream.write({ type: "message", session_key: c.session_key, visitor_name: c.visitor_name, message: c.message });
       }
-      cursor = new Date().toISOString();
-    } catch {
-      /* transient */
     }
+    cursor = new Date().toISOString();
   };
 
-  const finish = () => {
-    closed = true;
-    if (timer) clearInterval(timer);
-    try {
-      res.end();
-    } catch {
-      /* already closed */
-    }
-  };
-
-  send({ type: "connected", time: new Date().toISOString() }, "hello");
-  void tick();
-  timer = setInterval(() => void tick(), 2500);
-  req.on("close", finish);
+  stream.write({ type: "connected", time: new Date().toISOString() }, "hello");
+  pollSse(stream, 2500, tick);
 }

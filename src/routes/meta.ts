@@ -4,6 +4,7 @@ import { ah } from "../utils/async.js";
 import { str } from "../utils/validate.js";
 import { optionalAuth } from "../middleware/auth.js";
 import { metaService } from "../services/meta.service.js";
+import { openSse, pollSse } from "../utils/sse.js";
 
 const router = Router();
 
@@ -45,42 +46,18 @@ router.get("/activity", ah(async (req: Request, res: Response) => {
 // frontend falls back to 12s polling if the stream drops (short function
 // time limits on the platform).
 router.get("/activity/stream", (req: Request, res: Response) => {
-  res.set({
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-  res.flushHeaders?.();
-  res.write("retry: 8000\n\n");
-
+  // Headers, close handling, the lifetime cap and interval teardown are shared
+  // with the chat streams — see src/utils/sse.ts.
+  const stream = openSse(req, res, { retryMs: 8000, label: "meta:activity" });
   let cursor = new Date(Date.now() - 60_000).toISOString();
-  let closed = false;
-  let timer: NodeJS.Timeout | undefined;
-
-  const finish = () => {
-    if (closed) return;
-    closed = true;
-    if (timer) clearInterval(timer);
-    try { res.end(); } catch { /* closed */ }
-  };
 
   const tick = async () => {
-    if (closed) return;
-    try {
-      const events = await metaService.activitySince(cursor);
-      for (const e of events) {
-        try { res.write(`event: activity\ndata: ${JSON.stringify(e)}\n\n`); } catch { finish(); return; }
-      }
-      cursor = new Date().toISOString();
-    } catch {
-      /* transient */
-    }
+    const events = await metaService.activitySince(cursor);
+    for (const e of events) stream.write(e, "activity");
+    cursor = new Date().toISOString();
   };
 
-  void tick();
-  timer = setInterval(() => void tick(), 5000);
-  req.on("close", finish);
+  pollSse(stream, 5000, tick);
 });
 
 // GET /api/meta/reviews?kind=&product_id=&rating=
