@@ -6,6 +6,8 @@ import {
   resourcesReference,
   siteRoutes,
 } from "../data/content.js";
+import { navigationService } from "./navigation.service.js";
+import { isAfter, nowIso } from "../utils/time.js";
 import { all } from "../db/query.js";
 import { settingsRepo } from "../repos/settings.repo.js";
 import { productRepo } from "../repos/product.repo.js";
@@ -15,7 +17,7 @@ import { bloodRequestRepo } from "../repos/bloodRequest.repo.js";
 import { activityRepo } from "../repos/activity.repo.js";
 import { reviewRepo } from "../repos/review.repo.js";
 import { contentRepo } from "../repos/content.repo.js";
-import type { SiteSettings, SafeUser } from "../types.js";
+import type { SiteSettings, SafeUser, UserRow } from "../types.js";
 
 const BLOOD_GROUPS_SAFE = [...BLOOD_GROUPS];
 
@@ -175,14 +177,17 @@ export const metaService = {
       userRepo.listDonors({ limit: 5 }),
       bloodRequestRepo.listPublic({ limit: 5 }),
     ]);
-    const recentDonorView = (u: SafeUser) => ({
+    // `listDonors` returns raw rows, where flags are SQLite 0/1. The view
+    // coerces them so the homepage payload carries real booleans (the frontend
+    // only ever tests truthiness, and `!!0 === !!false`).
+    const recentDonorView = (u: UserRow) => ({
       id: u.id,
       name: u.name,
       blood_group: u.blood_group,
       district: u.district,
       upazila: u.upazila,
       image_file: u.image_file,
-      is_verified: u.is_verified,
+      is_verified: Boolean(u.is_verified),
     });
     const recentRequestView = (r: { id: string; blood_group: string; units: number; district: string | null; upazila: string | null; urgent: number; created_at: string }) => ({
       id: r.id,
@@ -212,10 +217,19 @@ export const metaService = {
     };
   },
 
-  /** Rows since a timestamp — used by the SSE broadcaster. */
+  /**
+   * Rows strictly after a cursor — used by the SSE broadcaster.
+   *
+   * The cursor arrives as ISO-8601 from the client, but `activity.created_at`
+   * is written by SQLite's `datetime('now')` default (`2026-09-13 06:49:18`).
+   * The previous `r.created_at > sinceIso` string comparison was ALWAYS false
+   * across those two formats, so the public activity stream connected, sent its
+   * heartbeat and never emitted a single event. Comparing parsed epoch values
+   * makes the cursor work regardless of which format a row was written in.
+   */
   async activitySince(sinceIso: string) {
     const rows = await activityRepo.list(100);
-    return rows.filter((r) => r.created_at > sinceIso).map(presentEvent);
+    return rows.filter((r) => isAfter(r.created_at, sinceIso)).map(presentEvent);
   },
 
   /** GET /api/meta/reviews — public review feed + summary. */
@@ -276,7 +290,23 @@ export const metaService = {
   },
 
   /** GET /api/meta/routes — site route catalogue (used by AI knowledge). */
+  /**
+   * GET /api/meta/routes — the site's page catalogue.
+   *
+   * Now served from the `navigation` table (seeded from the built-in
+   * `siteRoutes` array, editable in Admin → Navigation) instead of the frozen
+   * array in code, so hiding or renaming a page no longer needs a deploy. The
+   * response shape is unchanged: `{ success, routes: [{path,title,purpose,keywords}] }`.
+   */
   async routes() {
+    try {
+      const routes = await navigationService.routes();
+      if (routes.length) return { success: true, routes };
+    } catch (err) {
+      // The catalogue is a convenience, never a hard dependency: a navigation
+      // table problem must not take the whole meta endpoint down with it.
+      console.warn("[meta] navigation lookup failed, using the built-in catalogue", err);
+    }
     return { success: true, routes: siteRoutes };
   },
 

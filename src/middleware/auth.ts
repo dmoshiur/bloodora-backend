@@ -1,11 +1,16 @@
 import type { Request, Response, NextFunction } from "express";
 import { authService } from "../services/auth.service.js";
+import { applyUserLanguage } from "./language.js";
 import type { SafeUser } from "../types.js";
 
 declare module "express" {
   interface Request {
     user?: SafeUser;
     isAdminClaim?: boolean;
+    /** Effective role key resolved from the database by the RBAC guards. */
+    userRoleKey?: string;
+    /** Effective permission keys resolved from the database by the RBAC guards. */
+    userPermissions?: string[];
   }
 }
 
@@ -43,6 +48,9 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
     }
     req.user = user;
     req.isAdminClaim = user.role !== "user";
+    // A signed-in caller's saved preference outranks Accept-Language but never
+    // an explicit ?lang=/body.lang (that is how the frontend switcher works).
+    applyUserLanguage(req, user.language);
     next();
   } catch (err) {
     next(err);
@@ -56,6 +64,7 @@ export async function optionalAuth(req: Request, _res: Response, next: NextFunct
     if (user) {
       req.user = user;
       req.isAdminClaim = user.role !== "user";
+      applyUserLanguage(req, user.language);
     }
     next();
   } catch (err) {

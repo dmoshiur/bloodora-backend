@@ -2,7 +2,7 @@ import { Router } from "express";
 import { ah } from "../utils/async.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/admin.js";
+import { requirePermission } from "../middleware/rbac.js";
 import {
   listRequests,
   createRequest,
@@ -36,8 +36,8 @@ router.post("/:id/cancel", requireAuth, ah(cancelRequest));
 
 // Mounted at /api/admin/blood-requests.
 export const adminRouter = Router();
-adminRouter.get("/:id", requireAuth, requireAdmin, ah(getAdminRequest));
-adminRouter.patch("/:id/status", requireAuth, requireAdmin, ah(setRequestStatus));
-adminRouter.delete("/:id", requireAuth, requireAdmin, ah(deleteRequest));
+adminRouter.get("/:id", requireAuth, requirePermission("requests.view"), ah(getAdminRequest));
+adminRouter.patch("/:id/status", requireAuth, requirePermission("requests.moderate"), ah(setRequestStatus));
+adminRouter.delete("/:id", requireAuth, requirePermission("requests.moderate"), ah(deleteRequest));
 
 export default router;

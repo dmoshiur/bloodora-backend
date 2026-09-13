@@ -151,6 +151,14 @@ export const adminService = {
     if (["en", "bn", "ar"].includes(String(body.default_language))) {
       changes.default_language = String(body.default_language);
     }
+    // Delivery rules belong to the same panel. They were missing from this
+    // whitelist, so an admin could edit `delivery_fee` / `delivery_areas` in
+    // Site Settings, get "✅ updated", and checkout would keep charging the
+    // seeded ৳10 to Kalai only — the write was dropped without a word.
+    // `settingsService.update` still validates each value (non-negative number).
+    for (const key of ["delivery_fee", "delivery_areas", "free_shipping_threshold"] as const) {
+      if (body[key] !== undefined) changes[key] = pick(key);
+    }
     await settingsService.update(actor, changes);
     return { success: true, message: "✅ Site settings updated successfully!" };
   },

@@ -4,11 +4,35 @@ import type { AiMessageRow } from "../types.js";
 
 /** Live AI Help conversation history. */
 export const aiMessageRepo = {
-  async add(conversationId: string, userId: string | null, role: string, content: string, model: string | null): Promise<void> {
+  /**
+   * Persist one turn. Only the SANITIZED assistant text is ever stored — the
+   * model's reasoning is dropped before it reaches the database, so it cannot
+   * leak through the admin transcript view either.
+   */
+  async add(
+    conversationId: string,
+    userId: string | null,
+    role: string,
+    content: string,
+    model: string | null,
+    opts: { tokens?: number | null; reasoningChars?: number } = {},
+  ): Promise<void> {
     await run(
-      `INSERT INTO ai_messages (id, conversation_id, user_id, role, content, model) VALUES (?, ?, ?, ?, ?, ?)`,
-      [randomId(), conversationId, userId, role, content, model],
+      `INSERT INTO ai_messages (id, conversation_id, user_id, role, content, model, tokens, reasoning_chars)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [randomId(), conversationId, userId, role, content, model, opts.tokens ?? null, opts.reasoningChars ?? 0],
     );
+  },
+
+  /** Total tokens billed across stored turns (usage tracking). */
+  async totalTokens(): Promise<number> {
+    const row = await get<{ s: number | null }>(`SELECT COALESCE(SUM(tokens), 0) AS s FROM ai_messages`);
+    return Number(row?.s ?? 0);
+  },
+
+  async count(): Promise<number> {
+    const row = await get<{ n: number }>(`SELECT COUNT(*) AS n FROM ai_messages`);
+    return row?.n ?? 0;
   },
 
   /** Conversation history (bounded) for context reconstruction. */

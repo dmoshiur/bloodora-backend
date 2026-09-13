@@ -8,6 +8,7 @@ import { config } from "./config/env.js";
 import { logger } from "./utils/logger.js";
 import { ensureDbReady } from "./db/init.js";
 import { TursoSessionStore } from "./sessions/tursoStore.js";
+import { languageMiddleware } from "./middleware/language.js";
 import apiRouter from "./routes/index.js";
 import { serveUpload } from "./controllers/upload.controller.js";
 import { errorHandler, notFoundHandler } from "./middleware/error.js";
@@ -177,7 +178,21 @@ function createApp(): express.Express {
         next(Object.assign(new Error("Database is not ready"), { status: 503, code: "DB_NOT_READY" }));
       });
   };
-  app.use("/api", dbReady, apiRouter);
+  // Language resolution runs after body parsing (it reads a `lang` field) and
+  // after dbReady (the site default language is a settings row), but it is
+  // skipped for the health probe: a probe carries neither `?lang=` nor a
+  // supported Accept-Language, so it would trigger a settings read and make the
+  // "is the database up?" endpoint depend on the database.
+  const withLanguage = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const url = req.originalUrl.split("?")[0];
+    if (url === "/api/health" || url === "/health" || url.endsWith("/health")) {
+      next();
+      return;
+    }
+    void languageMiddleware(req, res, next);
+  };
+
+  app.use("/api", dbReady, withLanguage, apiRouter);
   // Root-level image serving (frontend references /uploads/<file> directly).
   // Wrapped in ah(): an unhandled async rejection here would crash the whole
   // process (Express 4 does not catch it), which is a hard DoS vector.

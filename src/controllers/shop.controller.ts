@@ -4,6 +4,7 @@ import { reviewService } from "../services/review.service.js";
 import { uploadService } from "../services/upload.service.js";
 import { readUpload } from "../uploads/uploads.js";
 import { str } from "../utils/validate.js";
+import { langOf } from "../middleware/language.js";
 import { ApiError } from "../utils/errors.js";
 
 // ---------- public ----------
@@ -35,7 +36,7 @@ export async function validateItem(req: Request, res: Response): Promise<void> {
 /** POST /api/shop/cart/resolve — {cart: {id: qty}}. */
 export async function resolveCart(req: Request, res: Response): Promise<void> {
   const cart = (req.body?.cart && typeof req.body.cart === "object" ? req.body.cart : {}) as Record<string, unknown>;
-  res.json({ success: true, ...(await shopService.resolveCart(cart)) });
+  res.json({ success: true, ...(await shopService.resolveCart(cart, langOf(req))) });
 }
 
 /** GET /api/shop/checkout/context */
@@ -49,7 +50,7 @@ export async function checkoutContext(req: Request, res: Response): Promise<void
 /** POST /api/shop/orders — checkout. */
 export async function placeOrder(req: Request, res: Response): Promise<void> {
   if (!req.user) throw ApiError.unauthorized();
-  const out = await shopService.placeOrder(req.user, req.body as Record<string, unknown>);
+  const out = await shopService.placeOrder(req.user, req.body as Record<string, unknown>, langOf(req));
   res.json({ success: true, ...out });
 }
 
@@ -68,7 +69,7 @@ export async function getOrder(req: Request, res: Response): Promise<void> {
 /** POST /api/shop/orders/:id/cancel — owner cancels while pending (restocks). */
 export async function cancelOrder(req: Request, res: Response): Promise<void> {
   if (!req.user) throw ApiError.unauthorized();
-  res.json({ success: true, ...(await shopService.cancelOwnOrder(req.user, req.params.id)) });
+  res.json({ success: true, ...(await shopService.cancelOwnOrder(req.user, req.params.id, langOf(req))) });
 }
 
 // ---------- reviews (user-facing) ----------
@@ -92,8 +93,8 @@ export async function createProduct(req: Request, res: Response): Promise<void> 
   if (!req.user) throw ApiError.unauthorized();
   const file = readUpload(req);
   const imageFile = file ? await uploadService.store(file) : null;
-  const message = await shopService.adminProductCreate(req.user, req.body as Record<string, unknown>, imageFile);
-  res.json({ success: true, message });
+  const out = await shopService.adminProductCreate(req.user, req.body as Record<string, unknown>, imageFile);
+  res.json({ success: true, ...out });
 }
 
 /** PUT /api/admin/products/:id */
@@ -127,13 +128,15 @@ export async function getAdminOrder(req: Request, res: Response): Promise<void> 
 /** POST /api/admin/orders/:id/confirm-payment */
 export async function confirmPayment(req: Request, res: Response): Promise<void> {
   if (!req.user) throw ApiError.unauthorized();
-  const message = await shopService.adminConfirmPayment(req.user, req.params.id);
+  const xff = req.headers["x-forwarded-for"];
+  const ip = typeof xff === "string" && xff.trim() ? xff.split(",")[0].trim() : req.ip || null;
+  const message = await shopService.adminConfirmPayment(req.user, req.params.id, ip);
   res.json({ success: true, message });
 }
 
 /** POST /api/admin/orders/:id/status — {status}. */
 export async function updateOrderStatus(req: Request, res: Response): Promise<void> {
   if (!req.user) throw ApiError.unauthorized();
-  const message = await shopService.adminOrderStatus(req.user, req.params.id, str(req.body.status) ?? "");
+  const message = await shopService.adminOrderStatus(req.user, req.params.id, str(req.body.status) ?? "", langOf(req));
   res.json({ success: true, message });
 }

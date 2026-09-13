@@ -1,4 +1,5 @@
 import { get, all, run } from "../db/query.js";
+import { nowIso } from "../utils/time.js";
 import type { UserRow } from "../types.js";
 
 export const userRepo = {
@@ -21,8 +22,9 @@ export const userRepo = {
          blood_group, city, address_holding, division, district, upazila, union_area,
          can_donate, age, date_of_birth, birth_certificate_number,
          bkash_number, nagad_number, upay_number, rocket_number, pathao_number,
-         card_last_four, card_type, is_verified, image_file, session_token)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         card_last_four, card_type, is_verified, image_file, session_token,
+         language, email_verified, notify_email, notify_inapp)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         row.id, row.name, row.email, row.phone, row.password_hash,
         row.is_admin, row.is_super_admin, row.role, row.donation_role,
@@ -30,8 +32,85 @@ export const userRepo = {
         row.can_donate, row.age, row.date_of_birth, row.birth_certificate_number,
         row.bkash_number, row.nagad_number, row.upay_number, row.rocket_number, row.pathao_number,
         row.card_last_four, row.card_type, row.is_verified, row.image_file, row.session_token,
+        row.language ?? "en", row.email_verified ?? 0, row.notify_email ?? 1, row.notify_inapp ?? 1,
       ],
     );
+  },
+
+  // ---------- preferences (v3) ----------
+
+  /** Language + notification channels. Only the fields passed are touched. */
+  async setPreferences(
+    id: string,
+    fields: { language?: string; notify_email?: boolean; notify_inapp?: boolean },
+  ): Promise<void> {
+    await run(
+      `UPDATE users SET
+         language = COALESCE(?, language),
+         notify_email = COALESCE(?, notify_email),
+         notify_inapp = COALESCE(?, notify_inapp)
+       WHERE id = ?`,
+      [
+        fields.language ?? null,
+        fields.notify_email === undefined ? null : fields.notify_email ? 1 : 0,
+        fields.notify_inapp === undefined ? null : fields.notify_inapp ? 1 : 0,
+        id,
+      ],
+    );
+  },
+
+  /** Email ownership verified (distinct from donor verification). */
+  async setEmailVerified(id: string, verified: boolean): Promise<void> {
+    await run(`UPDATE users SET email_verified = ?, email_verified_at = ? WHERE id = ?`, [
+      verified ? 1 : 0,
+      verified ? nowIso() : null,
+      id,
+    ]);
+  },
+
+  /** Record a successful authentication (dashboard + security emails). */
+  async touchLogin(id: string): Promise<void> {
+    await run(`UPDATE users SET last_login_at = ? WHERE id = ?`, [nowIso(), id]);
+  },
+
+  /** Paginated, filterable admin listing. Returns rows + the true total. */
+  async listPaged(opts: {
+    search?: string;
+    role?: string;
+    status?: "verified" | "unverified" | "donors" | "admins";
+    sort?: "created_at" | "name" | "email";
+    dir?: "asc" | "desc";
+    limit?: number;
+    offset?: number;
+  } = {}): Promise<{ rows: UserRow[]; total: number }> {
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (opts.search) {
+      where.push("(name LIKE ? OR email LIKE ? OR phone LIKE ? OR city LIKE ? OR blood_group LIKE ?)");
+      const like = `%${opts.search}%`;
+      args.push(like, like, like, like, like);
+    }
+    if (opts.role && ["user", "admin", "super_admin"].includes(opts.role)) {
+      where.push("role = ?");
+      args.push(opts.role);
+    }
+    if (opts.status === "verified") where.push("is_verified = 1");
+    if (opts.status === "unverified") where.push("is_verified = 0");
+    if (opts.status === "donors") where.push("can_donate = 1 AND is_verified = 1");
+    if (opts.status === "admins") where.push("is_admin = 1");
+
+    const clause = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+    const sort = ["created_at", "name", "email"].includes(opts.sort ?? "") ? opts.sort! : "created_at";
+    const dir = opts.dir === "asc" ? "ASC" : "DESC";
+    const limit = Math.min(200, Math.max(1, opts.limit ?? 25));
+    const offset = Math.max(0, opts.offset ?? 0);
+
+    const totalRow = await get<{ n: number }>(`SELECT COUNT(*) AS n FROM users${clause}`, args);
+    const rows = await all<UserRow>(
+      `SELECT * FROM users${clause} ORDER BY ${sort} ${dir}, id ${dir} LIMIT ? OFFSET ?`,
+      [...args, limit, offset],
+    );
+    return { rows, total: totalRow?.n ?? 0 };
   },
 
   async updateProfile(

@@ -281,6 +281,177 @@ const DDL: string[] = [
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
   `CREATE INDEX IF NOT EXISTS idx_ai_messages_conv ON ai_messages(conversation_id)`,
+
+  // ---------------------------------------------------------------------
+  // v3 — notifications, payments ledger, audit trail, RBAC, navigation,
+  // password-reset/verification tokens and a shared rate-limit store.
+  //
+  // Timestamps in every v3 table are written by the application as ISO-8601
+  // UTC (`2026-09-13T06:49:18.894Z`) instead of SQLite's `datetime('now')`
+  // (`2026-09-13 06:49:18`). Mixing the two formats is what broke the SSE
+  // cursors: a string comparison between the two is always false, so streams
+  // silently emitted nothing. `src/utils/time.ts` normalizes both on read so
+  // rows written by older deployments keep working.
+  // ---------------------------------------------------------------------
+
+  // In-app notification centre. `user_id` is either a real user id or the
+  // sentinel 'admins' for the admin desk (same convention as messages'
+  // recipient_id = 'admin'). `dedupe_key` makes creation idempotent: callers
+  // pass a deterministic key for "one notification per event" and a random one
+  // when repeats are legitimate.
+  `CREATE TABLE IF NOT EXISTS notifications (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    audience TEXT NOT NULL DEFAULT 'user',
+    type TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'info',
+    title TEXT NOT NULL,
+    body TEXT,
+    lang TEXT NOT NULL DEFAULT 'en',
+    entity_type TEXT,
+    entity_id TEXT,
+    link TEXT,
+    dedupe_key TEXT NOT NULL,
+    is_read INTEGER NOT NULL DEFAULT 0,
+    read_at TEXT,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(user_id, dedupe_key)`,
+  `CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at)`,
+
+  // Payment ledger. One row per money movement (charge or refund) so an order's
+  // payment history survives status changes and duplicate confirmations.
+  `CREATE TABLE IF NOT EXISTS transactions (
+    id TEXT PRIMARY KEY,
+    reference TEXT NOT NULL UNIQUE,
+    order_id TEXT,
+    user_id TEXT NOT NULL,
+    amount REAL NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'BDT',
+    method TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'charge',
+    status TEXT NOT NULL DEFAULT 'pending',
+    gateway TEXT,
+    gateway_ref TEXT,
+    confirmed_by TEXT,
+    confirmed_at TEXT,
+    note TEXT,
+    meta TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_tx_order ON transactions(order_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions(user_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_tx_status ON transactions(status)`,
+
+  // Admin/security audit trail (secrets are redacted before insert).
+  `CREATE TABLE IF NOT EXISTS audit_logs (
+    id TEXT PRIMARY KEY,
+    actor_id TEXT,
+    actor_role TEXT,
+    action TEXT NOT NULL,
+    entity_type TEXT,
+    entity_id TEXT,
+    summary TEXT,
+    meta TEXT,
+    ip TEXT,
+    user_agent TEXT,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs(actor_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)`,
+  `CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity_type, entity_id)`,
+
+  // RBAC. `users.role` stays the source of truth for the existing contract;
+  // roles/permissions describe what each role may do and are re-read from the
+  // database on every privileged request (never trusted from a JWT claim).
+  `CREATE TABLE IF NOT EXISTS roles (
+    id TEXT PRIMARY KEY,
+    key TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT,
+    level INTEGER NOT NULL DEFAULT 0,
+    is_system INTEGER NOT NULL DEFAULT 1,
+    seeded_permissions TEXT,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS permissions (
+    id TEXT PRIMARY KEY,
+    key TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    group_name TEXT,
+    description TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS role_permissions (
+    role_key TEXT NOT NULL,
+    permission_key TEXT NOT NULL,
+    PRIMARY KEY (role_key, permission_key)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_role_permissions_role ON role_permissions(role_key)`,
+
+  // Navigation manager. Seeded once from the built-in site route catalogue so
+  // GET /api/meta/routes keeps its exact shape, then admin-editable.
+  `CREATE TABLE IF NOT EXISTS navigation (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    path TEXT NOT NULL UNIQUE,
+    title TEXT,
+    purpose TEXT,
+    keywords TEXT,
+    area TEXT NOT NULL DEFAULT 'public',
+    section TEXT NOT NULL DEFAULT 'main',
+    icon TEXT,
+    position INTEGER NOT NULL DEFAULT 0,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    requires_auth INTEGER NOT NULL DEFAULT 0,
+    requires_admin INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_nav_area ON navigation(area, is_active, position)`,
+
+  // Single-use hashed tokens (password reset, email verification). Only the
+  // SHA-256 hash is stored — a database leak cannot be replayed.
+  `CREATE TABLE IF NOT EXISTS auth_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    ip TEXT,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_tokens_user ON auth_tokens(user_id, purpose)`,
+  `CREATE INDEX IF NOT EXISTS idx_tokens_expires ON auth_tokens(expires_at)`,
+
+  // Shared rate-limit counters. Serverless instances do not share memory, so
+  // the in-process limiter alone cannot stop a distributed brute-force; the
+  // sensitive scopes (login/register/reset/payment/AI) also count here.
+  `CREATE TABLE IF NOT EXISTS rate_limits (
+    bucket TEXT PRIMARY KEY,
+    count INTEGER NOT NULL DEFAULT 0,
+    window_end INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_rate_limits_end ON rate_limits(window_end)`,
+
+  // Outgoing mail that still has to be delivered (SMTP off/failed at request
+  // time). Flushed opportunistically and by GET /api/cron/maintenance.
+  `CREATE TABLE IF NOT EXISTS email_outbox (
+    id TEXT PRIMARY KEY,
+    to_email TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    html TEXT NOT NULL,
+    text TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    sent_at TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_outbox_status ON email_outbox(status, created_at)`,
 ];
 
 const SETTINGS_DEFAULTS: Record<string, string> = {
@@ -328,14 +499,13 @@ const SETTINGS_DEFAULTS: Record<string, string> = {
   delivery_fee: "10",
   free_shipping_threshold: "0",
   // --- SMTP ---
-  smtp_enabled: "0",
-  smtp_host: "",
-  smtp_port: "587",
-  smtp_secure: "0",
-  smtp_user: "",
-  smtp_pass: "",
-  smtp_from_name: "BloodOra",
-  smtp_from_email: "no-reply@bloodora.site",
+  // Deliberately NOT defaulted here. `resolveSmtpSettings()` treats a stored
+  // value as an explicit admin choice that overrides the environment, so seeding
+  // `smtp_enabled: "0"` / `smtp_port: "587"` silently disabled mail (and ignored
+  // SMTP_PORT) on every deployment that configures SMTP_* through env vars —
+  // with no way to tell from the panel why nothing was being sent. Absent rows
+  // mean "use the environment"; the first save from Admin → SMTP & Email writes
+  // real values and the panel becomes the override from then on.
   // --- Live AI Help ---
   ai_enabled: "1",
   ai_provider: "groq",
@@ -411,6 +581,42 @@ const MIGRATIONS: Array<[string, string, string]> = [
   ["reviews", "author_name", "TEXT"],
   // resources (v2: read_time from the original content manager)
   ["resources", "read_time", "TEXT"],
+  // live_messages (v3: idempotent sends — a retried/double-submitted message
+  // reconciles to the stored row instead of inserting a second bubble)
+  ["live_messages", "client_message_id", "TEXT"],
+  // users (v3: preferences, verification + login metadata)
+  ["users", "language", "TEXT NOT NULL DEFAULT 'en'"],
+  ["users", "email_verified", "INTEGER NOT NULL DEFAULT 0"],
+  ["users", "email_verified_at", "TEXT"],
+  ["users", "last_login_at", "TEXT"],
+  ["users", "notify_email", "INTEGER NOT NULL DEFAULT 1"],
+  ["users", "notify_inapp", "INTEGER NOT NULL DEFAULT 1"],
+  // ai_messages (v3: usage tracking + how much reasoning was stripped)
+  ["ai_messages", "tokens", "INTEGER"],
+  ["ai_messages", "reasoning_chars", "INTEGER NOT NULL DEFAULT 0"],
+];
+
+/**
+ * Indexes that depend on a migrated column. They MUST be created after
+ * `ensureColumn` runs — on a legacy database the column does not exist yet when
+ * the DDL block above executes, and `CREATE INDEX` would fail the whole
+ * bootstrap.
+ *
+ * SQLite treats NULLs as distinct in a UNIQUE index, so the rows written before
+ * v3 (client_message_id IS NULL) never collide with each other.
+ */
+const POST_MIGRATION_INDEXES: string[] = [
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_live_messages_client
+     ON live_messages(session_key, client_message_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_live_messages_created ON live_messages(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_users_created ON users(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_orders_payment_status ON orders(payment_status)`,
+  `CREATE INDEX IF NOT EXISTS idx_blood_created ON blood_requests(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_blood_user ON blood_requests(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_live_sessions_activity ON live_sessions(last_message_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_products_active ON products(is_active)`,
 ];
 
 /** Apply all DDL + migrations + settings defaults. Idempotent — safe on boot. */
@@ -420,6 +626,10 @@ export async function applySchema(): Promise<void> {
   }
   for (const [table, column, definition] of MIGRATIONS) {
     await ensureColumn(table, column, definition);
+  }
+  // After the migrated columns exist (see POST_MIGRATION_INDEXES).
+  for (const stmt of POST_MIGRATION_INDEXES) {
+    await run(stmt);
   }
   for (const [key, value] of Object.entries(SETTINGS_DEFAULTS)) {
     await run(
@@ -449,4 +659,14 @@ export const TABLES = [
   "site_notice",
   "email_log",
   "ai_messages",
+  "notifications",
+  "transactions",
+  "audit_logs",
+  "roles",
+  "permissions",
+  "role_permissions",
+  "navigation",
+  "auth_tokens",
+  "rate_limits",
+  "email_outbox",
 ];

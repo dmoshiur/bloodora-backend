@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import { userService } from "../services/user.service.js";
+import { ApiError } from "../utils/errors.js";
 import { uploadService } from "../services/upload.service.js";
 import { readUpload } from "../uploads/uploads.js";
 import { str } from "../utils/validate.js";
@@ -14,6 +15,28 @@ export async function listDonors(req: Request, res: Response): Promise<void> {
   });
   // `users` is the original contract key; `donors` kept for the old client.
   res.json({ success: true, users: donors, donors });
+}
+
+/**
+ * GET /api/user/dashboard — the signed-in caller's personal overview.
+ *
+ * One aggregate call instead of six: identity, donation eligibility, order and
+ * request counts, unread badges, spend and the most recent items. Everything is
+ * scoped to the session user; no id is read from the request.
+ */
+export async function dashboard(req: Request, res: Response): Promise<void> {
+  if (!req.user) throw ApiError.unauthorized();
+  res.json(await userService.dashboard(req.user));
+}
+
+/**
+ * PATCH /api/users/me/preferences — {language?, notify_email?, notify_inapp?}.
+ * Returns the updated account so the client can apply the new language at once.
+ */
+export async function setPreferences(req: Request, res: Response): Promise<void> {
+  if (!req.user) throw ApiError.unauthorized();
+  const user = await userService.setPreferences(req.user.id, (req.body ?? {}) as Record<string, unknown>);
+  res.json({ success: true, user, message: "✅ Preferences saved." });
 }
 
 /** GET /api/users/:id — public profile. */

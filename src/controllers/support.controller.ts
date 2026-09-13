@@ -1,5 +1,5 @@
 import type { Request, Response } from "express";
-import { liveChatService } from "../services/liveChat.service.js";
+import { clientMessageId, liveChatService } from "../services/liveChat.service.js";
 import { str } from "../utils/validate.js";
 
 // ---------- visitor side ----------
@@ -10,6 +10,7 @@ export async function startSession(req: Request, res: Response): Promise<void> {
     key: str(req.body.session_key),
     name: str(req.body.name),
     user: req.user ?? null,
+    lang: req.lang,
   });
   res.json(out);
 }
@@ -22,13 +23,22 @@ export async function fetchMessages(req: Request, res: Response): Promise<void> 
   res.json(out);
 }
 
-/** POST /api/support/messages — visitor sends a message. */
+/**
+ * POST /api/support/messages — visitor sends a message.
+ *
+ * Body: `{ session_key, body, client_message_id? }`. `client_message_id` is the
+ * idempotency key: send the same one twice (retry, reconnect replay, double
+ * click) and the second call returns the stored message with `duplicate: true`
+ * instead of creating a second row.
+ */
 export async function sendMessage(req: Request, res: Response): Promise<void> {
   const out = await liveChatService.send({
     key: str(req.body.session_key),
     name: str(req.body.name),
     user: req.user ?? null,
     body: str(req.body.body) || str(req.body.message),
+    clientMessageId: clientMessageId((req.body ?? {}) as Record<string, unknown>),
+    lang: req.lang,
   });
   res.json(out);
 }
@@ -111,10 +121,13 @@ export async function adminMessages(req: Request, res: Response): Promise<void> 
   res.json(await liveChatService.adminMessages(req.params.key));
 }
 
-/** POST /api/support/admin/sessions/:key/reply */
+/** POST /api/support/admin/sessions/:key/reply (idempotent via client_message_id) */
 export async function adminReply(req: Request, res: Response): Promise<void> {
   if (!req.user) throw new Error("LOGIN_REQUIRED");
-  const out = await liveChatService.adminReply(req.user, req.params.key, str(req.body.body) ?? "");
+  const out = await liveChatService.adminReply(req.user, req.params.key, str(req.body.body) ?? "", {
+    clientMessageId: clientMessageId((req.body ?? {}) as Record<string, unknown>),
+    lang: req.lang,
+  });
   res.json(out);
 }
 

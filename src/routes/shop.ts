@@ -2,7 +2,7 @@ import { Router } from "express";
 import { ah } from "../utils/async.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import { requireAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/admin.js";
+import { requirePermission } from "../middleware/rbac.js";
 import { singleUpload } from "../uploads/uploads.js";
 import {
   listProducts,
@@ -49,16 +49,20 @@ router.post("/reviews", requireAuth, ah(submitReview));
 //      /api/admin (original contract: /api/admin/products, /api/admin/orders). ----
 export const adminRouter = Router();
 
-adminRouter.get("/products", requireAuth, requireAdmin, ah(listAdminProducts));
-adminRouter.post("/products", requireAuth, requireAdmin, singleUpload("image"), ah(createProduct));
-adminRouter.put("/products/:id", requireAuth, requireAdmin, singleUpload("image"), ah(updateProduct));
-adminRouter.delete("/products/:id", requireAuth, requireAdmin, ah(deleteProduct));
+// Permission guards instead of a single `requireAdmin` bit: the seeded `admin`
+// role holds every key below, so an existing admin notices nothing, while a
+// custom role (e.g. "shopkeeper") can be granted `shop.products.manage` without
+// also getting `payments.confirm`.
+adminRouter.get("/products", requireAuth, requirePermission("shop.view"), ah(listAdminProducts));
+adminRouter.post("/products", requireAuth, requirePermission("shop.products.manage"), singleUpload("image"), ah(createProduct));
+adminRouter.put("/products/:id", requireAuth, requirePermission("shop.products.manage"), singleUpload("image"), ah(updateProduct));
+adminRouter.delete("/products/:id", requireAuth, requirePermission("shop.products.manage"), ah(deleteProduct));
 
-adminRouter.get("/orders", requireAuth, requireAdmin, ah(listAdminOrders));
-adminRouter.get("/orders/:id", requireAuth, requireAdmin, ah(getAdminOrder));
-adminRouter.post("/orders/:id/confirm-payment", requireAuth, requireAdmin, ah(confirmPayment));
-adminRouter.post("/orders/:id/status", requireAuth, requireAdmin, ah(updateOrderStatus));
-adminRouter.patch("/orders/:id/status", requireAuth, requireAdmin, ah(updateOrderStatus));
+adminRouter.get("/orders", requireAuth, requirePermission("orders.view"), ah(listAdminOrders));
+adminRouter.get("/orders/:id", requireAuth, requirePermission("orders.view"), ah(getAdminOrder));
+adminRouter.post("/orders/:id/confirm-payment", requireAuth, requirePermission("payments.confirm"), ah(confirmPayment));
+adminRouter.post("/orders/:id/status", requireAuth, requirePermission("orders.manage"), ah(updateOrderStatus));
+adminRouter.patch("/orders/:id/status", requireAuth, requirePermission("orders.manage"), ah(updateOrderStatus));
 
 router.use("/admin", adminRouter);
 

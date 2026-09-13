@@ -43,10 +43,54 @@ export interface UserRow {
   image_file: string | null;
   session_token: string | null;
   created_at: string;
+  /**
+   * v3 columns (added by `MIGRATIONS`). Declared optional so the pre-v3
+   * `userRepo.create()` call sites stay valid; every read from `SELECT *`
+   * populates them, and the INSERT writes explicit defaults.
+   *
+   * NOTE `is_verified` is DONOR verification (admin-approved, 18+) and drives
+   * the public donor directory — it is NOT email verification. `email_verified`
+   * is the account-ownership flag and the two must never be conflated.
+   */
+  language?: string;
+  email_verified?: number;
+  email_verified_at?: string | null;
+  last_login_at?: string | null;
+  notify_email?: number;
+  notify_inapp?: number;
 }
 
-/** User shape safe to send to clients / use in session data. */
-export type SafeUser = Omit<NoIndex<UserRow>, "password_hash" | "session_token">;
+/**
+ * User shape safe to send to clients / use in session data.
+ *
+ * Produced ONLY by `toSafeUser()`, which strips `password_hash` /
+ * `session_token` and converts the SQLite 0/1 flag columns to real booleans.
+ * Those flags are re-declared as `boolean` here so the type matches the runtime
+ * value: `if (user.is_admin)` and `user.is_admin === true` both work, while
+ * `user.is_admin === 1` is now a compile error instead of a silently-always-false
+ * check against a boolean.
+ */
+export type SafeUser = Omit<
+  NoIndex<UserRow>,
+  | "password_hash"
+  | "session_token"
+  | "is_admin"
+  | "is_super_admin"
+  | "is_verified"
+  | "can_donate"
+  | "email_verified"
+  | "notify_email"
+  | "notify_inapp"
+> & {
+  is_admin: boolean;
+  is_super_admin: boolean;
+  is_verified: boolean;
+  can_donate: boolean;
+  email_verified: boolean;
+  /** Defaults to true when the column is absent (legacy row). */
+  notify_email: boolean;
+  notify_inapp: boolean;
+};
 
 export interface ProductRow {
   id: string;
@@ -208,6 +252,11 @@ export interface LiveMessageRow {
   body: string;
   is_read: number;
   created_at: string;
+  /**
+   * Client-supplied idempotency key (v3). UNIQUE per session, so a retried send
+   * reconciles to the stored row instead of inserting a duplicate message.
+   */
+  client_message_id?: string | null;
 }
 
 export interface LiveSession extends NoIndex<LiveSessionRow> {
@@ -448,7 +497,12 @@ export interface AiMessage {
 }
 
 export interface AiResult {
+  /** The sanitized, user-facing answer (never contains model reasoning). */
   answer: string;
   model: string;
   tokens: number | null;
+  /** Raw provider usage block, when the provider returned one. */
+  usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number } | null;
+  /** How many characters of internal reasoning were stripped from the answer. */
+  reasoningChars?: number;
 }

@@ -92,6 +92,33 @@ export const bloodRequestRepo = {
     );
   },
 
+  /** The caller's own requests, newest first (personal dashboard). */
+  async listByUser(userId: string, limit = 20): Promise<BloodRequestRow[]> {
+    return all<BloodRequestRow>(
+      `SELECT * FROM blood_requests WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+      [userId, Math.min(100, Math.max(1, limit))],
+    );
+  },
+
+  /**
+   * Open vs fulfilled vs cancelled counts for one account.
+   * Both completion signals are honoured: older rows carry `is_fulfilled = 1`
+   * while newer ones set `status = 'fulfilled'`.
+   */
+  async countByUser(userId: string): Promise<{ total: number; open: number; fulfilled: number; cancelled: number }> {
+    const row = await get<{ total: number; fulfilled: number; cancelled: number }>(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN status = 'fulfilled' OR is_fulfilled = 1 THEN 1 ELSE 0 END) AS fulfilled,
+              SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled
+       FROM blood_requests WHERE user_id = ?`,
+      [userId],
+    );
+    const total = Number(row?.total ?? 0);
+    const fulfilled = Number(row?.fulfilled ?? 0);
+    const cancelled = Number(row?.cancelled ?? 0);
+    return { total, fulfilled, cancelled, open: Math.max(0, total - fulfilled - cancelled) };
+  },
+
   async fulfill(id: string, byUserId: string): Promise<void> {
     await run(
       `UPDATE blood_requests SET is_fulfilled = 1, status = 'fulfilled', fulfilled_at = datetime('now'), fulfilled_by = ?, updated_at = datetime('now') WHERE id = ?`,
