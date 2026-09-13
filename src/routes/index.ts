@@ -14,6 +14,12 @@ import adminRoutes from "./admin.js";
 
 const api = Router();
 
+// A predictable response at the API base makes misconfigured frontend URLs
+// immediately visible instead of looking like a generic 404.
+api.get("/", (_req, res) => {
+  res.json({ name: "bloodora-backend", status: "ok", health: "/api/health" });
+});
+
 api.use("/health", healthRoutes);
 api.use("/auth", authRoutes);
 api.use("/meta", metaRoutes);

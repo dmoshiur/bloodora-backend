@@ -133,12 +133,22 @@ function createApp(): express.Express {
     }),
   );
 
-  // Every API call (and stored-file serve) needs the DB ready exactly once.
+  // Every data API call (and stored-file serve) needs the DB ready exactly once.
+  // Liveness endpoints intentionally bypass bootstrap: they must still answer
+  // when the app process is up but Turso is unavailable, making a failed
+  // deployment distinguishable from a dead function.
   const dbReady = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.path === "/health") {
+      next();
+      return;
+    }
     ensureDbReady()
       .then(() => next())
       .catch((err) => {
-        logger.error("db: init failed", { err: String(err) });
+        logger.error("db: init failed", {
+          error: err instanceof Error ? err.message : String(err),
+          path: req.originalUrl,
+        });
         next(Object.assign(new Error("Database is not ready"), { status: 503, code: "DB_NOT_READY" }));
       });
   };
@@ -148,9 +158,18 @@ function createApp(): express.Express {
   // process (Express 4 does not catch it), which is a hard DoS vector.
   app.use("/uploads", dbReady, express.Router().get("/:file", ah(serveUpload)));
 
-  app.get("/", (_req, res) => {
-    res.json({ name: "bloodora-backend", status: "ok", health: "/api/health" });
-  });
+  const liveness = (_req: express.Request, res: express.Response) => {
+    res.json({
+      name: "bloodora-backend",
+      service: "bloodora-backend",
+      status: "ok",
+      health: "/api/health",
+    });
+  };
+  // Keep both URLs useful for a browser tab, curl, and platform probes. This
+  // check means "the process is reachable"; /api/health additionally verifies
+  // the database and returns 503 when the app is not ready for data requests.
+  app.get(["/", "/health"], liveness);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

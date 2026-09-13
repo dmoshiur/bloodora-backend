@@ -60,7 +60,34 @@ Required environment variables (all backend-only, never sent to the frontend):
 | `SMTP_*` | transactional mail (admin panel can override; skip-logged when off) |
 
 Production boot **fails fast** if any required variable is missing
-(`src/config/env.ts`).
+(`src/config/env.ts`). Set these values in the Vercel project settings for the
+**Production** environment; a `.env` file on your computer is not uploaded by
+Vercel.
+
+### Deployment smoke checks
+
+The app exposes two intentionally simple probes:
+
+```bash
+curl -i https://YOUR_PUBLIC_BACKEND_DOMAIN/
+# 200: {"name":"bloodora-backend","status":"ok",...}
+
+curl -i https://YOUR_PUBLIC_BACKEND_DOMAIN/api/health
+# 200 + db:"ok" when Turso is reachable; 503 + db:"error" otherwise
+```
+
+`/` and `/health` only check that the function is reachable. `/api/health` also
+performs a live database query. If curl returns a Vercel login page or a 401
+before these JSON responses, the request is being stopped by **Vercel
+Deployment Protection**, not by Express. Use the public production domain (not
+the long preview/deployment URL), or set Vercel → Project Settings →
+Deployment Protection to leave the production domain public. If a protected
+preview must be tested from curl/CI, use Vercel's protection-bypass header; do
+not put that bypass secret in this repository or in frontend code.
+
+The backend's production `FRONTEND_URL` is a comma-separated list of frontend
+origins. Trailing slashes are normalized, for example
+`https://bloodora.example,https://www.bloodora.example/`.
 
 Vercel runs `npm run build` (`tsc`) before bundling the function, so **every
 file under `src/` must be committed** — a source file hidden by `.gitignore`
