@@ -70,6 +70,17 @@ TypeScript stops auto-loading `@types/*`, and `@types/multer` is what declares
 the global `Express.Multer.File` namespace used by `admin.controller.ts`
 (`TS2694` without it).
 
+`helmet` is imported as a **namespace** in `src/app.ts` and its callable member
+is picked explicitly. helmet ships dual ESM/CJS builds whose declarations expose
+the middleware *only* as a default export, so which one a compiler binds depends
+on its resolution mode: this repo's `NodeNext` config takes `index.d.mts` (the
+callable default), while a CJS-oriented compile — such as the function-bundling
+step — takes `index.d.cts`, where a default import binds to the whole
+`module.exports` namespace and fails with
+`TS2349: This expression is not callable. Type 'typeof import("…/helmet/index")'
+has no call signatures`. The namespace form type-checks under both and is the
+same function at runtime either way.
+
 ## Security model
 
 - **Sessions** — `express-session` with `TursoSessionStore`
