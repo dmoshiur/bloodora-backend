@@ -52,8 +52,36 @@ export interface Config {
   tursoAuthToken: string;
 
   /**
+   * The platform's hard limit for ONE invocation, in ms.
+   *
+   * This MUST mirror `functions["api/index.ts"].maxDuration` in vercel.json
+   * (`npm run test:budget` asserts they agree). It is read from the environment
+   * rather than from the JSON file at runtime on purpose: reading files off disk
+   * inside a serverless handler is exactly the kind of thing that turns a config
+   * question into a failed probe.
+   */
+  functionMaxDurationMs: number;
+  /**
+   * Time held back from the budget to serialize and flush the response before
+   * the platform kills the invocation. A deadline that lands exactly ON the
+   * limit is a deadline that loses the race.
+   */
+  responseReserveMs: number;
+  /**
+   * `functionMaxDurationMs - responseReserveMs` — the time a request may
+   * actually spend doing work. EVERY deadline below is clamped to this, which is
+   * what stops "each operation is bounded" from silently adding up to "the
+   * request is not".
+   */
+  budgetMs: number;
+
+  /**
    * Deadlines. Every one of these exists because the thing it bounds could
    * previously block a request *forever* (see src/db/timeout.ts).
+   *
+   * Each is additionally CLAMPED to `budgetMs`: a deadline longer than the
+   * invocation itself is not a deadline, it is a guarantee that the platform
+   * answers for us (with an HTML 504 the frontend cannot parse).
    */
   /** Per single SQL statement, including its HTTP round trip. */
   dbTimeoutMs: number;
@@ -67,9 +95,13 @@ export interface Config {
   sessionTimeoutMs: number;
   /** Outer bound on any single HTTP request (0 disables). */
   requestTimeoutMs: number;
-  /** AI provider call. Must stay under the platform's function maxDuration. */
+  /**
+   * TOTAL budget for one AI interaction, covering every attempt and backoff —
+   * not a per-attempt timeout. The provider call used to be allowed 25 s per
+   * attempt with 2 attempts, i.e. 50.4 s inside a 10 s function.
+   */
   aiTimeoutMs: number;
-  /** SMTP connect/greeting/socket limits. */
+  /** SMTP connect/greeting/socket limits (per phase). */
   smtpTimeoutMs: number;
   /** How long an SSE stream keeps its function alive before ending gracefully. */
   sseMaxMs: number;
@@ -140,6 +172,50 @@ function build(): Config {
     throw new Error("FRONTEND_URL must define at least one frontend origin");
   }
 
+  // ---------------------------------------------------------------------------
+  // The platform budget, and the clamp every deadline passes through.
+  //
+  // vercel.json pins `maxDuration: 10` (Hobby rejects anything higher), so an
+  // invocation has 10 s of wall clock in total. Before this existed the app's
+  // own defaults were REQUEST_TIMEOUT_MS=55000, AI_TIMEOUT_MS=25000 (x2
+  // attempts) and DB_BATCH_TIMEOUT_MS=20000 — all longer than the invocation
+  // they were supposed to protect. A deadline the platform reaches first is not
+  // a deadline: Vercel killed the function and answered with an HTML
+  // `504 FUNCTION_INVOCATION_TIMEOUT` instead of our JSON envelope.
+  // ---------------------------------------------------------------------------
+  const functionMaxDurationMs = Math.max(1_000, int(env.FUNCTION_MAX_DURATION_MS, 10_000));
+  const responseReserveMs = Math.min(
+    Math.max(0, int(env.RESPONSE_RESERVE_MS, 500)),
+    Math.floor(functionMaxDurationMs / 2),
+  );
+  const budgetMs = functionMaxDurationMs - responseReserveMs;
+
+  /** Any deadline that outlives the invocation is clamped into it (and logged). */
+  const clamped: string[] = [];
+  const deadline = (name: string, requested: number, ceiling = budgetMs): number => {
+    // 0 / negative means "disabled" by this codebase's convention — respect it.
+    // (Returning 0 rather than `Math.max(0, requested)` keeps a NaN from ever
+    // reaching a setTimeout, where Node would coerce it to 1 and fire at once.)
+    if (!Number.isFinite(requested) || requested <= 0) return Number.isFinite(requested) ? Math.max(0, requested) : 0;
+    if (requested <= ceiling) return requested;
+    clamped.push(`${name}: ${requested}ms -> ${ceiling}ms`);
+    return ceiling;
+  };
+
+  const rawDbTimeoutMs = Math.max(0, int(env.DB_TIMEOUT_MS, 5_000));
+  const rawDbBatchTimeoutMs = Math.max(0, int(env.DB_BATCH_TIMEOUT_MS, 20_000));
+  const rawDbBootstrapTimeoutMs = Math.max(0, int(env.DB_BOOTSTRAP_TIMEOUT_MS, 8_000));
+  const rawHealthDbTimeoutMs = Math.max(0, int(env.HEALTH_DB_TIMEOUT_MS, 1_500));
+  const rawSessionTimeoutMs = Math.max(0, int(env.SESSION_TIMEOUT_MS, 3_000));
+  // Unset means "use the whole budget": the outer failsafe should fire as late
+  // as is still safe, never earlier than an operator asked for.
+  const rawRequestTimeoutMs = env.REQUEST_TIMEOUT_MS === undefined || env.REQUEST_TIMEOUT_MS === ""
+    ? budgetMs
+    : Math.max(0, int(env.REQUEST_TIMEOUT_MS, budgetMs));
+  const rawAiTimeoutMs = Math.max(0, int(env.AI_TIMEOUT_MS, 25_000));
+  const rawSmtpTimeoutMs = Math.max(0, int(env.SMTP_TIMEOUT_MS, 8_000));
+  const rawSseMaxMs = Math.max(0, int(env.SSE_MAX_MS, 9_000));
+
   const config: Config = {
     nodeEnv,
     isProd,
@@ -147,22 +223,39 @@ function build(): Config {
     logLevel: env.LOG_LEVEL || "info",
     tursoDatabaseUrl: env.TURSO_DATABASE_URL || "",
     tursoAuthToken: env.TURSO_AUTH_TOKEN || "",
-    // Deadlines — see src/db/timeout.ts for why each one is load-bearing.
+    functionMaxDurationMs,
+    responseReserveMs,
+    budgetMs,
+    // Deadlines — see src/db/timeout.ts for why each one is load-bearing, and
+    // `deadline()` above for why each one is clamped to the invocation budget.
     // A single SQLite statement over HTTPS should land well inside 1 s; 5 s is
     // already generous and still leaves room inside a 10 s function budget.
-    dbTimeoutMs: Math.max(0, int(env.DB_TIMEOUT_MS, 5_000)),
+    dbTimeoutMs: deadline("DB_TIMEOUT_MS", rawDbTimeoutMs),
     // A batch is ONE round trip but can carry every DDL statement or all 14
-    // seeded PNG blobs (~170 KB), so it gets a much wider bound than a statement.
-    dbBatchTimeoutMs: Math.max(0, int(env.DB_BATCH_TIMEOUT_MS, 20_000)),
+    // seeded PNG blobs (~170 KB), so it gets a wider bound than a statement —
+    // but never a wider bound than the invocation (it was 20 s in a 10 s one).
+    dbBatchTimeoutMs: deadline("DB_BATCH_TIMEOUT_MS", rawDbBatchTimeoutMs),
     // Must stay under the platform's function maxDuration, otherwise the runtime
     // kills the invocation (FUNCTION_INVOCATION_FAILED) instead of us answering.
-    dbBootstrapTimeoutMs: Math.max(0, int(env.DB_BOOTSTRAP_TIMEOUT_MS, 8_000)),
-    healthDbTimeoutMs: Math.max(0, int(env.HEALTH_DB_TIMEOUT_MS, 1_500)),
-    sessionTimeoutMs: Math.max(0, int(env.SESSION_TIMEOUT_MS, 3_000)),
-    requestTimeoutMs: Math.max(0, int(env.REQUEST_TIMEOUT_MS, 55_000)),
-    aiTimeoutMs: Math.max(0, int(env.AI_TIMEOUT_MS, 25_000)),
-    smtpTimeoutMs: Math.max(0, int(env.SMTP_TIMEOUT_MS, 8_000)),
-    sseMaxMs: Math.max(0, int(env.SSE_MAX_MS, 9_000)),
+    dbBootstrapTimeoutMs: deadline("DB_BOOTSTRAP_TIMEOUT_MS", rawDbBootstrapTimeoutMs),
+    healthDbTimeoutMs: deadline("HEALTH_DB_TIMEOUT_MS", rawHealthDbTimeoutMs),
+    sessionTimeoutMs: deadline("SESSION_TIMEOUT_MS", rawSessionTimeoutMs),
+    // The outer failsafe. It MUST fire before the platform does, otherwise the
+    // client gets Vercel's HTML 504 instead of our JSON one and can never tell a
+    // slow backend from a dead one. Defaults to the whole budget when unset.
+    requestTimeoutMs: deadline("REQUEST_TIMEOUT_MS", rawRequestTimeoutMs),
+    // TOTAL budget for one AI interaction including retries, not per attempt.
+    // The retry loop in ai.service.ts spends down against this.
+    aiTimeoutMs: deadline("AI_TIMEOUT_MS", rawAiTimeoutMs),
+    // nodemailer applies connectionTimeout, greetingTimeout AND socketTimeout as
+    // three sequential phases, so a per-phase value of 8 s was really up to 24 s
+    // for one send — and `flush()` sends up to 50 of them in a loop. Dividing the
+    // budget by three keeps the phases inside it; smtp.service.ts additionally
+    // bounds each send as a whole.
+    smtpTimeoutMs: deadline("SMTP_TIMEOUT_MS", rawSmtpTimeoutMs, Math.floor(budgetMs / 3)),
+    // An SSE stream holds its invocation open for its whole lifetime, so it has
+    // to end itself before the budget runs out.
+    sseMaxMs: deadline("SSE_MAX_MS", rawSseMaxMs),
     jwtSecret: env.JWT_SECRET || "",
     jwtTtlDays: int(env.JWT_TTL_DAYS, 7),
     cookieDomain: env.COOKIE_DOMAIN || "",
@@ -227,6 +320,27 @@ function build(): Config {
       }
     }
   }
+  if (clamped.length > 0) {
+    // Loud, once, at boot: an operator who set AI_TIMEOUT_MS=25000 needs to see
+    // that it was reduced, and why, rather than debugging a "timeout that
+    // doesn't match my env var".
+    logger.warn(
+      `env: ${clamped.length} deadline(s) exceeded the ${functionMaxDurationMs}ms function budget and were clamped (raise FUNCTION_MAX_DURATION_MS + vercel.json maxDuration together if the work genuinely needs longer)`,
+      { budgetMs, clamped },
+    );
+  }
+  logger.info("env: request budget", {
+    functionMaxDurationMs,
+    responseReserveMs,
+    budgetMs,
+    requestTimeoutMs: config.requestTimeoutMs,
+    aiTimeoutMs: config.aiTimeoutMs,
+    dbTimeoutMs: config.dbTimeoutMs,
+    dbBatchTimeoutMs: config.dbBatchTimeoutMs,
+    smtpTimeoutMs: config.smtpTimeoutMs,
+    sseMaxMs: config.sseMaxMs,
+  });
+
   if (!config.jwtSecret) {
     // Dev convenience only: without a JWT_SECRET, jsonwebtoken refuses to
     // sign ("secretOrPrivateKey must have a value") and every login 500s.

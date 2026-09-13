@@ -8,6 +8,7 @@ import { transactionRepo } from "../repos/transaction.repo.js";
 import { activityRepo } from "../repos/activity.repo.js";
 import { aiMessageRepo } from "../repos/aiMessage.repo.js";
 import { logger } from "../utils/logger.js";
+import { budgetExhausted } from "../utils/deadline.js";
 
 /**
  * Housekeeping that a long-lived server would do on a timer.
@@ -45,42 +46,73 @@ async function task(name: string, fn: () => Promise<number | Record<string, unkn
   }
 }
 
+/** The mail flush as a plain task body (shared by `flushMail` and `run`). */
+async function flushMailRaw(limit: number): Promise<Record<string, unknown>> {
+  return { ...(await emailService.flush(limit)) };
+}
+
+/** Time one more task may need; below this the sweep stops and reports. */
+const MIN_TASK_BUDGET_MS = 400;
+
 export const maintenanceService = {
   /** Retry everything still queued in the mail outbox. */
   async flushMail(limit = 20): Promise<TaskResult> {
-    return task("mail.flush", async () => {
-      const out = await emailService.flush(limit);
-      return { ...out };
-    });
+    return task("mail.flush", () => flushMailRaw(limit));
   },
 
   /**
    * Full sweep: mail queue, expired tokens, stale rate-limit buckets and the
    * bounded history tables.
    */
-  async run(opts: { flushMail?: boolean; mailLimit?: number } = {}): Promise<{ success: boolean; tasks: TaskResult[]; ms: number }> {
+  async run(opts: { flushMail?: boolean; mailLimit?: number } = {}): Promise<{
+    success: boolean;
+    tasks: TaskResult[];
+    /** Task names never started because the invocation ran out of time. */
+    skipped: string[];
+    ms: number;
+  }> {
     const started = Date.now();
     const tasks: TaskResult[] = [];
 
-    if (opts.flushMail !== false) tasks.push(await this.flushMail(opts.mailLimit ?? 20));
-
-    tasks.push(await task("tokens.purge", () => tokenRepo.purgeExpired()));
-    tasks.push(await task("rate_limits.purge", () => rateLimitRepo.purge()));
-    tasks.push(await task("notifications.prune", () => notificationRepo.prune()));
-    tasks.push(await task("audit.prune", () => auditRepo.prune()));
-    tasks.push(await task("transactions.prune", () => transactionRepo.prune()));
-    tasks.push(await task("activity.prune", () => activityRepo.prune()));
-    tasks.push(await task("ai_messages.prune", async () => {
+    // Each task is a bounded DB round trip, but seven of them plus a mail flush
+    // run SEQUENTIALLY in one invocation. The sweep therefore stops as soon as the
+    // budget runs low and reports what it did not reach: a partial sweep that
+    // answers beats a complete one the platform kills at 10 s and never delivers.
+    // Every task is idempotent, so the next run simply continues where this
+    // stopped.
+    const planned: Array<[string, () => Promise<number | Record<string, unknown>>]> = [];
+    if (opts.flushMail !== false) {
+      planned.push(["mail.flush", () => flushMailRaw(opts.mailLimit ?? 20)]);
+    }
+    planned.push(["tokens.purge", () => tokenRepo.purgeExpired()]);
+    planned.push(["rate_limits.purge", () => rateLimitRepo.purge()]);
+    planned.push(["notifications.prune", () => notificationRepo.prune()]);
+    planned.push(["audit.prune", () => auditRepo.prune()]);
+    planned.push(["transactions.prune", () => transactionRepo.prune()]);
+    planned.push(["activity.prune", () => activityRepo.prune()]);
+    planned.push(["ai_messages.prune", async () => {
       await aiMessageRepo.prune();
       return 0;
-    }));
+    }]);
+
+    const skipped: string[] = [];
+    for (const [name, fn] of planned) {
+      if (budgetExhausted(MIN_TASK_BUDGET_MS)) {
+        skipped.push(name);
+        continue;
+      }
+      tasks.push(await task(name, fn));
+    }
 
     const ms = Date.now() - started;
     logger.info("maintenance: sweep complete", {
       ms,
       failed: tasks.filter((t) => !t.ok).map((t) => t.task),
+      skipped,
     });
-    return { success: tasks.every((t) => t.ok), tasks, ms };
+    // A task skipped for lack of time is not a failure — `success` still reports
+    // whether everything that DID run worked, and `skipped` names the rest.
+    return { success: tasks.every((t) => t.ok), tasks, skipped, ms };
   },
 
   /** Outbox snapshot for the admin mail view. */

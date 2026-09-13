@@ -14,6 +14,7 @@ interface ShapedError {
 
 /** 404 for anything that fell through the routers. */
 export function notFoundHandler(_req: Request, res: Response): void {
+  if (res.headersSent) return;
   res.status(404).json({ error: { code: "NOT_FOUND", message: "Not found" } });
 }
 
@@ -24,6 +25,19 @@ export function notFoundHandler(_req: Request, res: Response): void {
  * Sensitive internals are logged server-side, never returned to the client.
  */
 export function errorHandler(err: unknown, req: Request, res: Response, _next: NextFunction): void {
+  // The request-level failsafe (`middleware/requestTimeout.ts`) may already have
+  // answered 504 while this handler was still running. Writing again would throw
+  // ERR_HTTP_HEADERS_SENT *inside the error handler* — the one place Express has
+  // nothing left to catch it with. Log and stop instead.
+  if (res.headersSent || res.writableEnded) {
+    logger.warn("error after the response was already sent — dropping", {
+      path: req.originalUrl,
+      method: req.method,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+
   let status = 500;
   let code = "INTERNAL";
   let message = "Something went wrong. Please try again.";
@@ -77,5 +91,12 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
   const errorObj: Record<string, unknown> = { code, message };
   if (details !== undefined) errorObj.details = details;
   if (issues) errorObj.issues = issues;
+  // A 504 we produced means the invocation ran out of time. Say so explicitly and
+  // tell the client it is safe to retry, so a frontend can clear its spinner and
+  // offer a retry instead of waiting on a response that will never come.
+  if (status === 504) {
+    errorObj.retryable = true;
+    res.setHeader("Retry-After", "1");
+  }
   res.status(status).json({ error: errorObj });
 }
