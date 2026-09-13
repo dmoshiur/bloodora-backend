@@ -29,6 +29,13 @@ npm run dev               # http://0.0.0.0:4000  (same app as production + a ser
 The first request runs an idempotent bootstrap: DDL → settings defaults →
 product seeds → super-admin provisioning (see `src/db/init.ts`).
 
+> The root-level `uploads/` folder is scratch space for `make-defaults` only —
+> nothing on the request path reads it. It is ignored by git as **`/uploads/`**
+> (anchored). An unanchored `uploads/` pattern also hides `src/uploads/`, which
+> is real source (`src/uploads/uploads.ts`), so a fresh clone — i.e. every
+> Vercel build — fails `tsc` with `TS2307 Cannot find module
+> '../uploads/uploads.js'`.
+
 ## Deployment (Vercel serverless)
 
 `vercel.json` compiles **`src/server.ts`** with `@vercel/node`. The file's
@@ -48,11 +55,20 @@ Required environment variables (all backend-only, never sent to the frontend):
 | `FRONTEND_URL` | comma-separated CORS allow-list (required in prod) |
 | `COOKIE_DOMAIN` | optional shared cookie domain |
 | `SUPER_ADMIN_EMAIL/PASSWORD/NAME/PHONE` | idempotent super-admin bootstrap |
+| `MAX_UPLOAD_MB` | optional per-image upload cap (default `4`; Vercel rejects request bodies over 4.5 MB) |
 | `GROQ_API_KEY`, `AI_*` | Live AI Help (admin panel can override) |
 | `SMTP_*` | transactional mail (admin panel can override; skip-logged when off) |
 
 Production boot **fails fast** if any required variable is missing
 (`src/config/env.ts`).
+
+Vercel runs `npm run build` (`tsc`) before bundling the function, so **every
+file under `src/` must be committed** — a source file hidden by `.gitignore`
+builds fine locally and fails the deploy with `TS2307`. Note also that
+`tsconfig.json` pins `types: ["node", "multer"]`: once `types` is set,
+TypeScript stops auto-loading `@types/*`, and `@types/multer` is what declares
+the global `Express.Multer.File` namespace used by `admin.controller.ts`
+(`TS2694` without it).
 
 ## Security model
 
@@ -78,6 +94,14 @@ Production boot **fails fast** if any required variable is missing
   transaction** (`orderRepo.placeTx`); stock is re-checked inside the
   transaction so overselling produces `422 OUT_OF_STOCK`, never a ghost order
   or negative stock.
+- **Uploads** — `src/uploads/uploads.ts` parses multipart bodies with multer's
+  **memory** storage (a serverless filesystem is read-only and ephemeral):
+  images only, a per-file size cap, random storage names (the client's file name
+  is never used in a path or URL), and every `MulterError` mapped to the
+  documented `400 UPLOAD_ERROR` instead of a `500`. Bytes are persisted into the
+  `uploads` table by `uploadService` and streamed back by `GET /uploads/:file`;
+  SVGs are served with `Content-Security-Policy: sandbox` so an embedded script
+  gets an opaque origin instead of the API's.
 - **Logging** — structured JSON, redacts `*secret/token/password/key/cookie*`
   fields, never logs request bodies; 5xx logs include stack + path.
 

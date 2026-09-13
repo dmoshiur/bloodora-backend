@@ -42,6 +42,12 @@ export async function serveUpload(req: Request, res: Response): Promise<void> {
   res.setHeader("Content-Type", row.mime);
   res.setHeader("Content-Length", String(data.byteLength));
   res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+  if (row.mime === "image/svg+xml") {
+    // An SVG can carry <script>; opened directly it would run on the API origin
+    // with the session cookie in scope. `sandbox` gives it an opaque origin, so
+    // it renders but can read nothing. Ignored for <img> embeds (the normal case).
+    res.setHeader("Content-Security-Policy", "sandbox");
+  }
   res.end(Buffer.from(data));
 }
 

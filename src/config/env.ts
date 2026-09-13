@@ -36,6 +36,9 @@ export interface Config {
   superAdminName: string;
   superAdminPhone: string;
 
+  /** Max size of a single uploaded image, in MB (multer `fileSize` limit). */
+  maxUploadMb: number;
+
   aiProvider: string;
   aiModel: string;
   aiBaseUrl: string;
@@ -85,6 +88,10 @@ function build(): Config {
     aiModel: env.AI_MODEL || "qwen/qwen3.6-27b",
     aiBaseUrl: env.AI_BASE_URL || "https://api.groq.com/openai/v1",
     groqApiKey: env.GROQ_API_KEY || "",
+    // 4 MB keeps uploads under Vercel's 4.5 MB request-body cap, so an oversized
+    // image is rejected by multer with our own 400 UPLOAD_ERROR JSON instead of
+    // the platform's opaque 413.
+    maxUploadMb: Math.max(1, int(env.MAX_UPLOAD_MB, 4)),
     smtp: {
       enabled: bool(env.SMTP_ENABLED, false),
       host: env.SMTP_HOST || "",
