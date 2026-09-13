@@ -14,34 +14,57 @@ import { errorHandler, notFoundHandler } from "./middleware/error.js";
 import { ah } from "./utils/async.js";
 
 /**
- * helmet publishes dual ESM/CJS builds (`index.mjs` + `index.cjs`) whose
- * declarations expose the middleware only as `export { helmet as default }`.
- * WHICH declaration a compiler picks depends on its resolution mode:
+ * helmet publishes dual ESM/CJS builds (`index.mjs` + `index.cjs`) and exports
+ * the middleware ONLY as a default export — there is no named `helmet` export to
+ * fall back on (checked against helmet 7.2.0). WHICH declaration a compiler picks
+ * depends on its resolution mode, and the two disagree about what `default` is:
  *
- *   - this repo's tsconfig (`module/moduleResolution: NodeNext`) takes the ESM
- *     `index.d.mts` → a default import is the callable middleware;
+ *   - this repo's tsconfig (`module`/`moduleResolution: NodeNext`) takes the ESM
+ *     `index.d.mts` → `default` is the callable middleware;
  *   - a CJS-oriented compile (Vercel's `@vercel/node` function step resolves the
- *     `require` condition → `index.d.cts`) binds a default import to the whole
+ *     `require` condition → `index.d.cts`) models `default` as the whole
  *     `module.exports` namespace, which is NOT callable:
  *
  *       src/app.ts: error TS2349: This expression is not callable.
  *         Type 'typeof import(".../node_modules/helmet/index")'
  *         has no call signatures.
  *
- * So take the callable member explicitly instead of default-importing it. Both
- * shapes are the same function at runtime: the ESM build has a real default
- * export, and the CJS build ends with `module.exports = exports.default;
- * module.exports.default = module.exports`. Options stay fully typed through
- * helmet's own `HelmetOptions`.
+ * Reaching for the member through a cast only relocates that failure, because the
+ * CJS shape is self-referential (`module.exports.default === module.exports`), so
+ * the compiler sees `default` as the namespace again and refuses the assertion:
+ *
+ *       src/app.ts: error TS2352: Conversion of type
+ *         'typeof import(".../node_modules/helmet/index")' to type
+ *         '{ default?: HelmetMiddleware | undefined; }' may be a mistake …
+ *         Types of property 'default' are incompatible.
+ *
+ * So stop asking the type system which shape it picked and ask the VALUE at
+ * runtime — every build hands back the same function somewhere:
+ *
+ *   - ESM build / Node's CJS-interop → `default` is the function;
+ *   - CJS build (`module.exports = exports.default;` then
+ *     `module.exports.default = module.exports`) → `default` is the function;
+ *   - `require`-style interop (no synthetic default) → the namespace object the
+ *     import produced IS the function itself.
+ *
+ * `typeof x === "function"` selects whichever one is present, and routing through
+ * `unknown` keeps the compiler from re-deriving a shape it may be wrong about.
+ * Options stay fully typed through helmet's own `HelmetOptions`.
  */
 type HelmetMiddleware = (options?: Readonly<HelmetOptions>) => express.RequestHandler;
-const helmet: HelmetMiddleware =
-  (helmetExports as { default?: HelmetMiddleware }).default ?? (helmetExports as unknown as HelmetMiddleware);
-if (typeof helmet !== "function") {
-  // Never reached with a real helmet install; keeps a broken/partial one legible
-  // instead of dying later as "helmet is not a function" inside createApp().
-  throw new Error("helmet: resolved module is not callable (expected a default-exported middleware)");
-}
+
+const helmet: HelmetMiddleware = (() => {
+  const ns = helmetExports as unknown as Record<string, unknown>;
+  const resolved = [ns.default, ns.helmet, ns].find(
+    (candidate): candidate is HelmetMiddleware => typeof candidate === "function",
+  );
+  if (typeof resolved !== "function") {
+    // Never reached with a real helmet install; keeps a broken/partial one legible
+    // instead of dying later as "helmet is not a function" inside createApp().
+    throw new Error("helmet: resolved module is not callable (expected a default-exported middleware)");
+  }
+  return resolved;
+})();
 
 function createApp(): express.Express {
   const app = express();
