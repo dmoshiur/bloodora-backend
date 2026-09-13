@@ -152,8 +152,18 @@ function createApp(): express.Express {
   // Liveness endpoints intentionally bypass bootstrap: they must still answer
   // when the app process is up but Turso is unavailable, making a failed
   // deployment distinguishable from a dead function.
+  //
+  // Note: dbReady is mounted as `app.use("/api", dbReady, apiRouter)`, so for
+  // a request to `/api/health` Express reports `req.path === "/api/health"`
+  // (and `req.originalUrl === "/api/health"`). The earlier check for
+  // `req.path === "/health"` therefore never matched the real health probe,
+  // causing every `/api/health` request to pay the DB init cost and to fail
+  // with 503 when Turso is down — exactly the opposite of what the probe is
+  // for. Accept both forms.
   const dbReady = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if (req.path === "/health") {
+    const p = req.path;
+    const url = req.originalUrl.split("?")[0];
+    if (p === "/health" || p === "/api/health" || url === "/api/health" || url === "/health" || p.endsWith("/health")) {
       next();
       return;
     }

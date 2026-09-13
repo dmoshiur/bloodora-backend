@@ -2,9 +2,9 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
   "functions": {
+    "api/index.ts": { "memory": 1024 },
     "src/server.ts": { "memory": 1024 }
   },
-  "routes": [
-    { "src": "/(.*)", "dest": "src/server.ts" }
-  ]
+  "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
+  "routes": [{ "src": "/(.*)", "dest": "api/index.ts" }]
 }
