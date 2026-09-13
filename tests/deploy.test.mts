@@ -15,7 +15,7 @@
  *
  * Usage: npm run test:deploy
  */
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -185,12 +185,52 @@ const clientSrc = code(read("src/db/client.ts"));
 step("getClient() bounds the libSQL transport with a timed fetch", /fetch:\s*timedFetch/.test(clientSrc));
 step("the database URL is logged without credentials", /safeHost/.test(clientSrc) && !/tursoAuthToken/.test(clientSrc.slice(clientSrc.indexOf("logger.info"))));
 
-// Every query helper goes through one bounded choke point.
+// Every query helper goes through one guarded choke point: breaker gate →
+// deadline → classification. Nothing may reach the driver around it.
 const querySrc = code(read("src/db/query.ts"));
 step("query.ts exposes batch() — one round trip per statement group", /export async function batch/.test(querySrc));
-step("single statements are bounded", /bounded\(getClient\(\)\.execute/.test(querySrc));
-step("batches are bounded", /bounded\(\s*getClient\(\)\.batch/.test(querySrc));
-step("transaction open/commit/rollback are all bounded", (querySrc.match(/bounded\(tx\.|bounded\(getClient\(\)\.transaction/g) || []).length >= 4, String((querySrc.match(/bounded\(/g) || []).length));
+step("single statements go through the guarded choke point", /guarded\("SQL query", \(\) => getClient\(\)\.execute/.test(querySrc));
+step("batches go through the guarded choke point", /guarded\(\s*`SQL batch/.test(querySrc));
+step("transaction open/steps/commit/rollback all go through it", (querySrc.match(/guarded\("(open transaction|tx statement|tx query|commit transaction|rollback transaction)"/g) || []).length >= 5, String((querySrc.match(/guarded\(/g) || []).length));
+step("no database call bypasses the guard (no raw withTimeout left in query.ts)", !/withTimeout\(/.test(querySrc.replace(/await withTimeout\(start\(\), ms, label\)/, "")));
+step("the guard consults the breaker BEFORE starting the call", querySrc.indexOf("dbBreaker.allow(") < querySrc.indexOf("await withTimeout(start()"), "gate must precede work");
+step("the guard records the outcome so the breaker can open and close", /dbBreaker\.noteSuccess\(/.test(querySrc) && /dbBreaker\.noteFailure\(/.test(querySrc));
+step("the health probe bypasses the gate (it must report truth, not our pessimism)", /probeQuery[\s\S]*?true\)/.test(querySrc));
+
+// The breaker itself: fail fast while the database is down, recover by itself.
+const breakerSrc = code(read("src/db/breaker.ts"));
+step("src/db/breaker.ts exists", breakerSrc.length > 0);
+step("the breaker opens only after several consecutive failures", /FAILURE_THRESHOLD/.test(breakerSrc));
+step("the breaker admits exactly one half-open trial", /trialInFlight/.test(breakerSrc));
+step("the breaker closes itself on the next success (no redeploy needed)", /noteSuccess\(operation/.test(breakerSrc) && /state\.openedAt = 0/.test(breakerSrc));
+step("the breaker ignores SQL errors (a buggy query must not close the API)", /if \(!isDbDependencyError\(err\)\)/.test(breakerSrc));
+step("an outage backs off instead of retrying in a tight loop", /MAX_COOLDOWN_MS/.test(breakerSrc));
+
+// Classification: a dependency failure is a 503, a SQL failure is left alone.
+const dbErrSrc = code(read("src/db/errors.ts"));
+step("transport failures are classified as 503 DB_UNAVAILABLE", /status: 503/.test(dbErrSrc) && /DB_UNAVAILABLE/.test(dbErrSrc));
+step("socket-level causes are recognised (undici nests them under `cause`)", /for \(const link of chain\(err\)\)/.test(dbErrSrc) && /ECONNRESET/.test(dbErrSrc));
+step("a rejected Turso token is distinguished from an outage", /auth_rejected/.test(dbErrSrc));
+step("SQL errors are NOT remapped (constraint violations still mean 409)", /if \(!isDbDependencyError\(err\)\) return err;/.test(dbErrSrc));
+// The body a client receives is built from the CATEGORY only; the driver's own
+// message (which can name the host) is written to the log and goes no further.
+const publicBuilder = dbErrSrc.slice(dbErrSrc.indexOf("export function dbUnavailable("), dbErrSrc.indexOf("export function dbUnavailableError("));
+step("the client-facing 503 is built from the category, never the driver message", publicBuilder.length > 0 && !/messageOf|err\.message|detail/.test(publicBuilder));
+step("the driver message is logged server-side only", /logger\.warn\("db: dependency failure/.test(dbErrSrc) && /detail: messageOf\(err\)/.test(dbErrSrc));
+// Over HTTP the driver reports EVERY statement error as `code:"UNKNOWN"` and puts
+// the real `SQLITE_*` code in the message (verified against the remote transport),
+// so the message is the only reliable way to keep a 409/500 from becoming a 503.
+step("a SQL failure is recognised by its message, not by err.code", /SQL_MARKER/.test(dbErrSrc) && /export function isSqlError/.test(dbErrSrc));
+step("a SQL failure is ruled out before any transport heuristic runs", dbErrSrc.indexOf("isSqlError(err)") < dbErrSrc.indexOf("fetch failed"));
+// The same words describe both problems: Turso rejects a bad token with
+// "invalid token"/401, and THIS API rejects a bad bearer token with
+// "Unauthorized"/"jwt malformed". Only provenance keeps them apart — guessing
+// from the message alone turned a correct 401 into a 503 "database credentials".
+step("message heuristics apply only to errors the driver produced", /if \(!isDriverError\(err\)\) return false;/.test(dbErrSrc));
+step("driver provenance is judged by error class, transport status or our own shaping", /DRIVER_ERROR_NAMES/.test(dbErrSrc) && /statusOf\(link\) >= 400/.test(dbErrSrc));
+step("the HTTP status is classified where only it can still be seen (timedFetch)", /transportStatusError\(resp\.status/.test(code(read("src/db/timeout.ts"))));
+const errSrc2 = code(read("src/middleware/error.ts"));
+step("a non-retryable dependency failure says so instead of inviting a retry loop", /retryable: reason !== "auth_rejected" && reason !== "not_configured"/.test(dbErrSrc) && /shaped\.retryable === false \? false/.test(errSrc2));
 
 // (a) the schema stage must not cost one request per statement.
 const schemaSrc = code(read("src/db/schema.ts"));
@@ -212,7 +252,11 @@ step("RBAC catalogue seeding reads state in one batch", /await batch\(\[`SELECT 
 
 // (b) the health probe must be answerable without the database.
 const healthRaw = read("src/controllers/health.controller.ts");
-step("the health probe is bounded by its own deadline", /withTimeout\(/.test(code(healthRaw)));
+step("the health probe is bounded by its own deadline", /probeQuery<\{ ok: number \}>\(`SELECT 1 AS ok`, \[\], config\.healthDbTimeoutMs\)/.test(code(healthRaw)));
+step("health exposes the `ok` boolean a client should branch on", /\bok,\n/.test(healthRaw) || /ok,$/.test(healthRaw.split("res.status")[1] ?? ""));
+step("health reports a leak-free failure category", /publicReason\(err\)/.test(code(healthRaw)));
+step("health echoes the request ID for support/debugging", /requestId/.test(healthRaw));
+step("a successful health probe closes the breaker", /dbBreaker\.noteSuccess\("health probe"\)/.test(code(healthRaw)));
 step("health reports the database state explicitly", /database: "connected" \| "unavailable"|database,/.test(healthRaw));
 step("health keeps the legacy `db` field the contract suite reads", /db: ok \? "ok" : "error"/.test(healthRaw));
 
@@ -222,11 +266,28 @@ step("probes bypass the DB bootstrap middleware", /if \(isProbePath\(req\)\) \{\
 step("a request-level failsafe is mounted before the routes", /app\.use\(requestTimeout\)/.test(appSrc) && appSrc.indexOf("app.use(requestTimeout)") < appSrc.indexOf('app.use("/api"'));
 step("boot stages are logged for root-cause debugging", /\[BOOT\]/.test(read("src/app.ts")));
 
+// Request identity + one response shape, both applied before any handler runs.
+const ridSrc = code(read("src/middleware/requestId.ts"));
+step("every request gets a correlation ID", /newRequestId\(\)/.test(ridSrc));
+step("an inbound/platform request ID is reused, not replaced", /x-vercel-id|VERCEL_ID/.test(ridSrc));
+step("an inbound ID is sanitised before it is echoed or logged", /sanitizeIncoming/.test(ridSrc));
+step("the ID is returned on the response", /setHeader\("X-Request-Id"/.test(ridSrc));
+const envSrc = code(read("src/middleware/envelope.ts"));
+step("success bodies carry `ok` without touching existing fields", /ok: res\.statusCode < 400/.test(envSrc));
+step("the envelope never wraps arrays or binary bodies", /isPlainObject/.test(envSrc));
+step("failure bodies carry `ok: false`, a flat `message` and the request ID", /ok: false/.test(errSrc2) && /requestId,/.test(errSrc2));
+step("a 503 dependency failure is marked retryable with Retry-After", /breakerRetryAfterSeconds\(\)/.test(errSrc2) && /setHeader\("Retry-After"/.test(errSrc2));
+step("the error handler re-classifies a dependency failure that reached it unshaped", /isDbDependencyError\(err\)/.test(errSrc2) && /classifyDbError\(/.test(errSrc2));
+step("...but never an error that is already shaped, or that is not the driver's", /status === undefined/.test(errSrc2) && /isDriverError\(err\)/.test(errSrc2));
+
 const rtSrc = code(read("src/middleware/requestTimeout.ts"));
 step("the failsafe only fires when nothing has been written yet", /res\.headersSent/.test(rtSrc));
 step("the failsafe answers 504 instead of leaving the socket open", /504/.test(rtSrc) && /REQUEST_TIMEOUT/.test(rtSrc));
 step("the failsafe never keeps an instance alive", /unref/.test(rtSrc));
 step("request logging never includes bodies, cookies or query strings", /split\("\?"\)\[0\]/.test(rtSrc) && !/req\.body/.test(rtSrc) && !/req\.headers\.cookie/.test(rtSrc));
+step("every request is logged at INFO in production (LOG_LEVEL=info shows it)", /logger\.info\("\[API\] request"/.test(rtSrc) && /logger\.info\("\[API\] response"/.test(rtSrc));
+step("the request log line carries the correlation ID", /requestId,\s*\}\);/.test(rtSrc) || /requestId \}/.test(rtSrc));
+step("the failsafe 504 body carries the flat envelope too (it bypasses errorHandler)", /ok: false/.test(rtSrc) && /requestId,/.test(rtSrc));
 
 // (b) the session store sits BEFORE the router, so it must fail fast and open.
 const storeSrc = code(read("src/sessions/tursoStore.ts"));
@@ -269,9 +330,53 @@ step(".env.example documents JWT_SECRET", /JWT_SECRET/.test(envExample));
 step(".env.example documents FRONTEND_URL", /FRONTEND_URL/.test(envExample));
 step(".env.example documents the SMTP variables the outbox needs", /SMTP_HOST/.test(envExample) && /SMTP_ENABLED/.test(envExample));
 step(".env.example documents the deadline knobs", ["DB_TIMEOUT_MS", "DB_BOOTSTRAP_TIMEOUT_MS", "HEALTH_DB_TIMEOUT_MS", "REQUEST_TIMEOUT_MS", "AI_TIMEOUT_MS", "SSE_MAX_MS"].every((k) => envExample.includes(k)), "missing a timeout variable");
+step(".env.example documents the caller's reserve", /UPSTREAM_RESERVE_MS/.test(envExample));
+step(".env.example documents the circuit breaker", ["DB_BREAKER_THRESHOLD", "DB_BREAKER_COOLDOWN_MS", "DB_BREAKER_MAX_COOLDOWN_MS"].every((k) => envExample.includes(k)), "missing a breaker variable");
+step(".env.example's AI default fits inside the caller's budget", /AI_TIMEOUT_MS=(\d+)/.test(envExample) && Number(/AI_TIMEOUT_MS=(\d+)/.exec(envExample)?.[1]) <= 6_000, /AI_TIMEOUT_MS=(\d+)/.exec(envExample)?.[1] ?? "?");
 step(".env.example documents no secret VALUES", !/(eyJ|sk-[A-Za-z0-9]{10}|-----BEGIN)/.test(envExample));
+step("a remote-transport suite exists (the file: engine cannot exercise the network path)", typeof pkg.scripts?.["test:remote"] === "string", JSON.stringify(Object.keys(pkg.scripts || {})));
+step("the aggregate test script runs it", /test:remote/.test(pkg.scripts?.test ?? ""));
+step("engines pins the Node major the platform runs (22.x), not an open range", /22/.test(String(pkg.engines?.node)), String(pkg.engines?.node));
 step("a production-path e2e suite exists", typeof pkg.scripts?.["test:e2e"] === "string", JSON.stringify(Object.keys(pkg.scripts || {})));
 step("the aggregate test script runs the e2e suite", /test:e2e/.test(pkg.scripts?.test ?? ""));
+
+// ---------------- DEP0169: the deprecated `url.parse()` ----------------
+//
+// Production logs carried
+//   (node:NN) [DEP0169] DeprecationWarning: `url.parse()` behavior is deprecated
+// and it arrived right next to the outage lines, which is how a cosmetic warning
+// gets blamed for an incident. What the investigation established:
+//
+//   * nothing under src/ or api/ calls `url.parse()` — the app parses URLs with
+//     WHATWG `new URL()` only;
+//   * the warning therefore comes from a dependency on the platform's Node
+//     runtime (it is not even emitted on Node 22.22, only on newer runtimes);
+//   * the reachable dependency sites are `parseurl`'s non-fast path (Express only
+//     reaches it for a `req.url` that does not start with "/", which the platform
+//     never sends) and nodemailer's internal URL helpers (only used when a
+//     transport is created from a URL STRING — smtp.service.ts passes an options
+//     object, so they never run).
+//
+// It is a warning, not a crash vector: Node still executes `url.parse()`, and
+// DEP0169 has no removal date. These assertions exist so the ONE thing we control
+// stays controlled — a new `url.parse()` in our source would be ours to remove,
+// and it would make the log line ambiguous again.
+const sourceFiles = (dir: string): string[] =>
+  readdirSync(path.join(ROOT, dir), { withFileTypes: true }).flatMap((entry) => {
+    const rel = path.join(dir, entry.name);
+    if (entry.isDirectory()) return sourceFiles(rel);
+    return /\.m?ts$/.test(entry.name) ? [rel] : [];
+  });
+const appSource = ["src", "api"].flatMap((dir) => (existsSync(path.join(ROOT, dir)) ? sourceFiles(dir) : []));
+step("the app's own sources are scanned for the deprecated API", appSource.length > 20, String(appSource.length));
+const legacyParse = appSource.filter((file) => /\burl\.parse\s*\(/.test(code(read(file))));
+step("no source file calls the deprecated url.parse() [DEP0169]", legacyParse.length === 0, legacyParse.join(", "));
+const legacyImport = appSource.filter((file) =>
+  /import\s*\{[^}]*\bparse\b[^}]*\}\s*from\s*["'](?:node:)?url["']|require\(\s*["'](?:node:)?url["']\s*\)/.test(code(read(file))),
+);
+step("no source file imports the legacy `url` parser", legacyImport.length === 0, legacyImport.join(", "));
+step("URLs are parsed with the supported WHATWG API instead", /new URL\(/.test(code(read("src/db/client.ts"))));
+step("the runtime is pinned to the Node major this was verified against", /^22/.test(String(pkg.engines?.node)), String(pkg.engines?.node));
 
 console.log(`\n=== ${pass} passed, ${failures.length} failed ===`);
 if (failures.length) {

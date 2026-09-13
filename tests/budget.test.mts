@@ -86,7 +86,22 @@ const rtSrc = code(read("src/middleware/requestTimeout.ts"));
 step("the middleware establishes the deadline every layer clamps to", /runWithDeadline\(/.test(rtSrc));
 step("the failsafe fires INSIDE the platform limit (grace < reserve)", /graceMs/.test(rtSrc) && /config\.requestTimeoutMs \+ graceMs/.test(rtSrc));
 step("the failsafe still never writes over a streaming response", /res\.headersSent/.test(rtSrc));
-step("a request with no budget still gets one (REQUEST_TIMEOUT_MS=0 is not an escape hatch on serverless)", /config\.requestTimeoutMs > 0 \? config\.requestTimeoutMs : config\.budgetMs/.test(rtSrc));
+step("a request with no budget still gets one (REQUEST_TIMEOUT_MS=0 is not an escape hatch on serverless)", /config\.requestTimeoutMs > 0 \? config\.requestTimeoutMs : config\.answerByMs/.test(rtSrc));
+
+// ---------------- the CALLER's budget: two functions, one 10 s clock ----------------
+// The frontend that renders BloodOra's pages is itself a Vercel function on the
+// same limit, and it awaits this API before it can answer the browser. A budget
+// spent entirely by the inner hop is one the outer hop cannot survive — it gets
+// killed mid-render and the platform answers the browser with an HTML 504 that no
+// client can parse. That is how a healthy backend still looks like a crash.
+step("env.ts holds back a reserve for the calling function", /UPSTREAM_RESERVE_MS/.test(envSrc) && /upstreamReserveMs/.test(envSrc));
+step("the reserve cannot starve the work it protects (capped at a third of the budget)", /Math\.floor\(budgetMs \/ 3\)/.test(envSrc));
+step("answerByMs is the budget minus the caller's reserve", /answerByMs = budgetMs - upstreamReserveMs/.test(envSrc));
+step("the outer failsafe is clamped to the caller-safe point, not the whole budget", /deadline\("REQUEST_TIMEOUT_MS",\s*rawRequestTimeoutMs,\s*answerByMs\)/.test(envSrc));
+step("the AI interaction is clamped to the caller-safe point", /deadline\("AI_TIMEOUT_MS",\s*rawAiTimeoutMs,\s*answerByMs\)/.test(envSrc));
+step("an SSE stream ends before the proxying function is killed", /deadline\("SSE_MAX_MS",\s*rawSseMaxMs,\s*answerByMs\)/.test(envSrc));
+step("the AI default is sized for the work, not for the platform limit", /int\(env\.AI_TIMEOUT_MS,\s*6_000\)/.test(envSrc));
+step("the caller reserve is logged at boot next to the rest of the budget", /upstreamReserveMs,\s*answerByMs,/.test(envSrc));
 
 const toSrc = code(read("src/db/timeout.ts"));
 step("withTimeout() clamps to the remaining request budget", /clampToRemaining\(ms\)/.test(toSrc));
@@ -186,6 +201,10 @@ step(`the budget leaves a response reserve`, config.budgetMs === TEST_MAX_DURATI
 step(`REQUEST_TIMEOUT_MS was clamped into the budget`, config.requestTimeoutMs <= config.budgetMs, `${config.requestTimeoutMs} > ${config.budgetMs}`);
 step(`AI_TIMEOUT_MS was clamped into the budget`, config.aiTimeoutMs <= config.budgetMs, `${config.aiTimeoutMs} > ${config.budgetMs}`);
 step(`DB_BATCH_TIMEOUT_MS was clamped into the budget`, config.dbBatchTimeoutMs <= config.budgetMs, `${config.dbBatchTimeoutMs} > ${config.budgetMs}`);
+step(`the caller's reserve is held back from the budget`, config.answerByMs === config.budgetMs - config.upstreamReserveMs && config.upstreamReserveMs > 0, `answerBy=${config.answerByMs} budget=${config.budgetMs} reserve=${config.upstreamReserveMs}`);
+step(`a whole request must be answerable before the caller's own deadline`, config.requestTimeoutMs <= config.answerByMs, `${config.requestTimeoutMs} > ${config.answerByMs}`);
+step(`the AI interaction must be answerable before the caller's own deadline`, config.aiTimeoutMs <= config.answerByMs, `${config.aiTimeoutMs} > ${config.answerByMs}`);
+step(`an SSE stream must end before the caller's own deadline`, config.sseMaxMs <= config.answerByMs, `${config.sseMaxMs} > ${config.answerByMs}`);
 
 async function chat(label: string) {
   const t0 = Date.now();
@@ -215,6 +234,7 @@ async function chat(label: string) {
 providerMode = "stall";
 const stalled = await chat("stalled provider");
 step("a stalled provider answers BEFORE the platform would kill the invocation", stalled.ms < TEST_MAX_DURATION_MS, `${stalled.ms}ms >= ${TEST_MAX_DURATION_MS}ms`);
+step("...and early enough that a caller on the SAME limit can still answer the browser", stalled.ms < config.answerByMs + 1000, `${stalled.ms}ms vs answerBy ${config.answerByMs}ms`);
 step("the answer is JSON, not the platform's HTML 504", stalled.contentType.includes("application/json"), stalled.contentType);
 step("the body parses (a frontend's `await res.json()` will not throw)", stalled.parsed !== null, stalled.transportError ?? "");
 step("the client is told what happened", stalled.parsed?.error?.code === "AI_TIMEOUT", String(stalled.parsed?.error?.code));

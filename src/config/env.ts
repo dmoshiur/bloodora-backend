@@ -74,6 +74,32 @@ export interface Config {
    * request is not".
    */
   budgetMs: number;
+  /**
+   * Time held back for **our caller**, not for us.
+   *
+   * This API is not usually the last hop. The BloodOra frontend is a
+   * server-rendered Express app deployed as its own Vercel function with the
+   * SAME 10 s limit, and it calls this API over the network while a browser
+   * waits on it:
+   *
+   *   browser → frontend function (10 s) → THIS function (10 s) → Turso / Groq
+   *
+   * A budget spent entirely by the inner hop is a budget the outer hop cannot
+   * survive: if this API answers at t=9.5 s, the caller has 0.5 s left to render
+   * a page, and the platform kills IT — answering the browser with an HTML
+   * `504 FUNCTION_INVOCATION_TIMEOUT` that no client can parse. That is how a
+   * perfectly healthy backend still presents as "the server crashed". So the
+   * inner hop deliberately stops early.
+   */
+  upstreamReserveMs: number;
+  /**
+   * `budgetMs - upstreamReserveMs` — the point by which a response must already
+   * be on the wire so that a caller running under the same platform limit can
+   * still finish. Deadlines that belong to a *whole request* (the outer failsafe,
+   * an AI interaction, an SSE stream) are clamped to THIS; per-operation
+   * deadlines stay clamped to `budgetMs`.
+   */
+  answerByMs: number;
 
   /**
    * Deadlines. Every one of these exists because the thing it bounds could
@@ -190,6 +216,25 @@ function build(): Config {
   );
   const budgetMs = functionMaxDurationMs - responseReserveMs;
 
+  // ---------------------------------------------------------------------------
+  // The CALLER's budget.
+  //
+  // The frontend that renders BloodOra's pages is itself a Vercel function on the
+  // same 10 s limit, and it awaits this API before it can render. Whatever this
+  // function spends, the caller must still have enough left to answer the
+  // browser. Holding back `UPSTREAM_RESERVE_MS` is what keeps a slow AI answer or
+  // a slow database from turning into an HTML 504 from the OUTER function — the
+  // failure mode a browser cannot parse and a spinner cannot survive.
+  //
+  // Capped at a third of the budget so a large reserve can never starve the work
+  // it is supposed to protect.
+  // ---------------------------------------------------------------------------
+  const upstreamReserveMs = Math.min(
+    Math.max(0, int(env.UPSTREAM_RESERVE_MS, 1_500)),
+    Math.floor(budgetMs / 3),
+  );
+  const answerByMs = budgetMs - upstreamReserveMs;
+
   /** Any deadline that outlives the invocation is clamped into it (and logged). */
   const clamped: string[] = [];
   const deadline = (name: string, requested: number, ceiling = budgetMs): number => {
@@ -207,12 +252,17 @@ function build(): Config {
   const rawDbBootstrapTimeoutMs = Math.max(0, int(env.DB_BOOTSTRAP_TIMEOUT_MS, 8_000));
   const rawHealthDbTimeoutMs = Math.max(0, int(env.HEALTH_DB_TIMEOUT_MS, 1_500));
   const rawSessionTimeoutMs = Math.max(0, int(env.SESSION_TIMEOUT_MS, 3_000));
-  // Unset means "use the whole budget": the outer failsafe should fire as late
-  // as is still safe, never earlier than an operator asked for.
+  // Unset means "answer by the caller-safe point": the outer failsafe should fire
+  // as late as is still safe FOR THE WHOLE CHAIN, never earlier than an operator
+  // asked for and never later than the caller can tolerate.
   const rawRequestTimeoutMs = env.REQUEST_TIMEOUT_MS === undefined || env.REQUEST_TIMEOUT_MS === ""
-    ? budgetMs
-    : Math.max(0, int(env.REQUEST_TIMEOUT_MS, budgetMs));
-  const rawAiTimeoutMs = Math.max(0, int(env.AI_TIMEOUT_MS, 25_000));
+    ? answerByMs
+    : Math.max(0, int(env.REQUEST_TIMEOUT_MS, answerByMs));
+  // A Groq answer normally lands in 1–4 s. The old 25 s default was clamped to the
+  // whole invocation, which meant one slow model call could consume every
+  // millisecond the CALLER also needed — so the default is now sized for the work,
+  // not for the platform limit.
+  const rawAiTimeoutMs = Math.max(0, int(env.AI_TIMEOUT_MS, 6_000));
   const rawSmtpTimeoutMs = Math.max(0, int(env.SMTP_TIMEOUT_MS, 8_000));
   const rawSseMaxMs = Math.max(0, int(env.SSE_MAX_MS, 9_000));
 
@@ -226,6 +276,8 @@ function build(): Config {
     functionMaxDurationMs,
     responseReserveMs,
     budgetMs,
+    upstreamReserveMs,
+    answerByMs,
     // Deadlines — see src/db/timeout.ts for why each one is load-bearing, and
     // `deadline()` above for why each one is clamped to the invocation budget.
     // A single SQLite statement over HTTPS should land well inside 1 s; 5 s is
@@ -242,11 +294,14 @@ function build(): Config {
     sessionTimeoutMs: deadline("SESSION_TIMEOUT_MS", rawSessionTimeoutMs),
     // The outer failsafe. It MUST fire before the platform does, otherwise the
     // client gets Vercel's HTML 504 instead of our JSON one and can never tell a
-    // slow backend from a dead one. Defaults to the whole budget when unset.
-    requestTimeoutMs: deadline("REQUEST_TIMEOUT_MS", rawRequestTimeoutMs),
+    // slow backend from a dead one — and it must fire early enough that a caller
+    // running under the SAME platform limit can still answer the browser.
+    requestTimeoutMs: deadline("REQUEST_TIMEOUT_MS", rawRequestTimeoutMs, answerByMs),
     // TOTAL budget for one AI interaction including retries, not per attempt.
-    // The retry loop in ai.service.ts spends down against this.
-    aiTimeoutMs: deadline("AI_TIMEOUT_MS", rawAiTimeoutMs),
+    // The retry loop in ai.service.ts spends down against this. Clamped to
+    // `answerByMs` because the AI answer has to travel back through the frontend
+    // function, which is on the same 10 s clock.
+    aiTimeoutMs: deadline("AI_TIMEOUT_MS", rawAiTimeoutMs, answerByMs),
     // nodemailer applies connectionTimeout, greetingTimeout AND socketTimeout as
     // three sequential phases, so a per-phase value of 8 s was really up to 24 s
     // for one send — and `flush()` sends up to 50 of them in a loop. Dividing the
@@ -254,8 +309,10 @@ function build(): Config {
     // bounds each send as a whole.
     smtpTimeoutMs: deadline("SMTP_TIMEOUT_MS", rawSmtpTimeoutMs, Math.floor(budgetMs / 3)),
     // An SSE stream holds its invocation open for its whole lifetime, so it has
-    // to end itself before the budget runs out.
-    sseMaxMs: deadline("SSE_MAX_MS", rawSseMaxMs),
+    // to end itself before the budget runs out — and before the proxying frontend
+    // function (same platform limit) is killed mid-stream, which the browser sees
+    // as a truncated response rather than a clean end.
+    sseMaxMs: deadline("SSE_MAX_MS", rawSseMaxMs, answerByMs),
     jwtSecret: env.JWT_SECRET || "",
     jwtTtlDays: int(env.JWT_TTL_DAYS, 7),
     cookieDomain: env.COOKIE_DOMAIN || "",
@@ -333,10 +390,15 @@ function build(): Config {
     functionMaxDurationMs,
     responseReserveMs,
     budgetMs,
+    upstreamReserveMs,
+    answerByMs,
     requestTimeoutMs: config.requestTimeoutMs,
     aiTimeoutMs: config.aiTimeoutMs,
     dbTimeoutMs: config.dbTimeoutMs,
     dbBatchTimeoutMs: config.dbBatchTimeoutMs,
+    dbBootstrapTimeoutMs: config.dbBootstrapTimeoutMs,
+    healthDbTimeoutMs: config.healthDbTimeoutMs,
+    sessionTimeoutMs: config.sessionTimeoutMs,
     smtpTimeoutMs: config.smtpTimeoutMs,
     sseMaxMs: config.sseMaxMs,
   });

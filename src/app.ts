@@ -13,6 +13,8 @@ import apiRouter from "./routes/index.js";
 import { serveUpload } from "./controllers/upload.controller.js";
 import { errorHandler, notFoundHandler } from "./middleware/error.js";
 import { requestTimeout } from "./middleware/requestTimeout.js";
+import { requestContext } from "./middleware/requestId.js";
+import { responseEnvelope } from "./middleware/envelope.js";
 import { ah } from "./utils/async.js";
 
 /**
@@ -96,8 +98,17 @@ function createApp(): express.Express {
   app.disable("x-powered-by");
   app.set("trust proxy", 1); // behind Vercel's edge / LBs
 
-  // Outer failsafe + request accounting. Mounted FIRST so every request — including
-  // the probes — is logged and bounded; see middleware/requestTimeout.ts.
+  // Correlation ID first: every log line and every response header below it needs
+  // the ID to exist already (see middleware/requestId.ts).
+  app.use(requestContext);
+
+  // One response shape (`ok: true|false`) applied centrally, before any handler
+  // can write a body (see middleware/envelope.ts).
+  app.use(responseEnvelope);
+
+  // Outer failsafe + request accounting. Mounted before the routes so every
+  // request — including the probes — is logged and bounded; see
+  // middleware/requestTimeout.ts.
   app.use(requestTimeout);
 
   // Platform probes and browser asset requests must never depend on Turso,
