@@ -146,81 +146,105 @@ same function at runtime either way.
 ## API overview
 
 Base: `/api` — errors always return `{ error: { code, message, details? } }`.
+This table is generated from `src/routes/*` — it is the contract the BloodOra
+frontend (dmoshiur/lspk) calls, verified end-to-end by `npm run test:contract`.
 
-| Method & path | Auth | Description |
-| --- | --- | --- |
-| `GET /api/health` | – | liveness + real `SELECT 1` DB round-trip |
-| `GET /api/meta` | – | site settings, categories, divisions, payment methods |
-| `POST /api/auth/register` | – | create account (first account = super admin) |
-| `POST /api/auth/login` | – | login → `{user, token}` + session cookie |
-| `POST /api/auth/logout` | cookie/bearer | rotate session token (revokes JWTs) |
-| `GET /api/auth/me` | ✓ | current user |
-| `PATCH /api/auth/profile` | ✓ | update name/email/phone/blood/city |
-| `POST /api/auth/password` | ✓ | change password |
-| `POST /api/auth/profile/image` | ✓ | multipart `image` → profile picture |
-| `GET /api/donors` | – | verified donor directory |
-| `GET /api/shop/products` | – | list (`?category=&search=&page=`) |
-| `GET /api/shop/products/:id` | – | product by id or slug + approved reviews |
-| `POST /api/shop/cart` | – | price a cart server-side (returns out-of-stock list) |
-| `POST /api/shop/orders` | ✓ | place order (atomic stock deduction) |
-| `GET /api/shop/orders/mine` | ✓ | my orders |
-| `GET /api/shop/orders/:id` | owner | one order |
-| `POST /api/shop/orders/:id/cancel` | owner | cancel while pending (restocks) |
-| `POST /api/shop/reviews` | ✓ | review a purchased product (moderated) |
-| `POST /api/shop/admin/products` | admin | create product (`image` optional) |
-| `PUT /api/shop/admin/products/:id` | admin | update product |
-| `DELETE /api/shop/admin/products/:id` | admin | delete product |
-| `PATCH /api/shop/admin/products/:id/stock` | admin | `{delta}` stock adjust |
-| `GET /api/shop/admin/orders` | admin | orders (`?status=`) |
-| `GET /api/shop/admin/orders/:id` | admin | one order + items |
-| `PATCH /api/shop/admin/orders/:id/status` | admin | advance status / confirm payment |
-| `GET /api/blood-requests` | – | public board (`?status=&group=&page=`) |
-| `POST /api/blood-requests` | – | post request (division/district/upazila or `location`) |
-| `GET /api/blood-requests/mine` | ✓ | my requests |
-| `PATCH /api/admin/blood-requests/:id/status` | admin | confirm/fulfil/cancel |
-| `DELETE /api/admin/blood-requests/:id` | admin | delete |
-| `POST /api/messages` | ✓ | user → support desk |
-| `GET /api/messages/mine` | ✓ | my messages + unread |
-| `POST /api/messages/read` | ✓ | mark read |
-| `GET /api/admin/messages/inbox` | admin | desk inbox |
-| `POST /api/admin/messages/:id/reply` | admin | reply to user |
-| `GET /api/chat` | ✓ | my thread + chat key |
-| `POST /api/chat/send` | ✓ | user message |
-| `GET /api/chat/poll?since=` | ✓ | poll new entries |
-| `GET /api/admin/chat` | admin | threads + unread |
-| `GET /api/admin/chat/:userId` | admin | thread history |
-| `POST /api/admin/chat/:userId/reply` | admin | reply |
-| `POST /api/admin/chat/reply-by-message/:id` | admin | reply addressed by message id |
-| `POST /api/ai/ask` | – | Live AI Help (`{question, history?}`) |
-| `GET /api/ai/status` | – | availability flag (no secrets) |
-| `GET /api/admin/ai/preview` | admin | current knowledge base |
-| `POST /api/uploads` | ✓ | generic image upload (multipart `file`) |
-| `GET /uploads/:file` · `GET /api/uploads/:file` | – | serve stored image |
-| `GET /api/admin/dashboard` | admin | stats, recent orders/users, low stock |
-| `GET /api/admin/activities` | admin | live activity feed |
-| `GET /api/admin/content` | admin | content index for the CMS view |
-| `GET /api/admin/users` | admin | list/search users |
-| `PATCH /api/admin/users/:id/role` | admin | `user`/`admin`/`super_admin` |
-| `PATCH /api/admin/users/:id/verified` | admin | donor verification |
-| `DELETE /api/admin/users/:id` | admin | delete (guards: self, super-admin) |
-| `POST /api/admin/impersonate` | admin | `{user_id}` → token bound to target |
-| `POST /api/admin/switch-back` | admin | return to the original admin |
-| `GET /api/admin/settings` | admin | settings (secrets masked) |
-| `PUT /api/admin/settings` | admin | update (send `••••••••` to keep a secret) |
-| `POST /api/admin/settings/logo` | admin | replace logo (multipart `logo`) |
-| `GET /api/admin/reviews/pending` | admin | moderation queue |
-| `POST /api/admin/reviews/:id/approve` | admin | approve/reject (`?approve=0`) |
-| `DELETE /api/admin/reviews/:id` | admin | delete review |
+### Public
+
+| Method & path | Description |
+| --- | --- |
+| `GET /api/health` | liveness + real `SELECT 1` DB round-trip |
+| `GET /api/meta` | site settings, categories, divisions, payment methods, delivery |
+| `GET /api/meta/settings` · `/home` · `/locations` · `/routes` | page-level meta views |
+| `GET /api/meta/activity?limit=` · `/activity/stream` | live activity feed (JSON + SSE) |
+| `GET /api/meta/reviews?kind=&product_id=&rating=` | published reviews + summary |
+| `GET /api/meta/antid` · `/compatibility` · `/resources` | static clinical/educational content |
+| `GET /api/meta/chat-auth` | live-chat widget identity (guest id or account) |
+| `GET /api/donors` | verified donor directory (`?bg=&dist=&upa=&age_min=`) |
+| `GET /api/shop/products` · `/products/:id` | catalogue (id **or** slug) + approved reviews |
+| `GET /api/shop/categories` | live category list with product counts |
+| `POST /api/shop/cart/validate-item` | `{product_id, qty}` availability check |
+| `POST /api/shop/cart/resolve` | `{cart: {id: qty}}` → priced items, stock guard |
+| `GET /api/ai/config` · `/status` | Live AI Help availability (no secrets) |
+| `POST /api/ai/chat` · `/ask` | AI chat (503 + friendly message when unconfigured) |
+| `POST /api/support/session` | start/resume a live-chat thread (`{session_key}`) |
+| `GET /api/support/messages?session=&after=` | poll thread messages |
+| `POST /api/support/messages` | `{session_key, body}` visitor message |
+| `GET /api/support/stream?session=` | visitor SSE channel |
+| `GET /api/blood-requests` | public board (`?bg=&dist=&division=&urgent=`) |
+| `GET /api/blood-requests/urgent` | urgent-only board |
+| `GET /api/blood-requests/:id` | one request |
+| `POST /api/blood-requests` | post request (guest or logged-in) |
+| `POST /api/blood-requests/urgent-contact` | urgent-help contact form |
+| `GET /api/users/:id` · `/:id/public` | public profile |
+| `GET /uploads/:file` · `GET /api/uploads/:file` | serve stored image |
+
+### Authenticated (user)
+
+| Method & path | Description |
+| --- | --- |
+| `POST /api/auth/register` | create account — **first account becomes super admin** |
+| `POST /api/auth/login` | login → `{user, token}` (rotates the session token, revoking older JWTs) |
+| `POST /api/auth/logout` | rotate session token — revokes every issued JWT immediately |
+| `GET /api/auth/me` | current user |
+| `PATCH /api/auth/profile` | update name/email/phone/blood/city |
+| `POST /api/auth/password` | `{current, next}` change password |
+| `POST /api/auth/profile/image` | multipart `image` → profile picture |
+| `PUT /api/users/me` | self-service profile edit (multipart, optional `profile_pic`) |
+| `POST /api/users/me/toggle-status` | donation availability toggle |
+| `POST /api/users/me/apply-verification` | 18+ gate, admin reviews afterwards |
+| `GET /api/shop/checkout/context` | gateway numbers + saved wallet/address |
+| `POST /api/shop/orders` | checkout — `{cart, payment_method, division, district, upazila, …}` (Kalai only), atomic stock deduction |
+| `GET /api/shop/orders/mine` | my orders |
+| `GET /api/shop/orders/:id` | owner (or admin) order + items |
+| `POST /api/shop/orders/:id/cancel` | owner cancels while `pending` — stock restored in one transaction |
+| `POST /api/reviews` · `POST /api/shop/reviews` | review a purchased product (`{title, body, rating, product_id}`, moderated) |
+| `GET /api/reviews/mine` | my reviews |
+| `POST /api/messages` | `{subject, content}` → support desk |
+| `GET /api/messages` | inbox (`received`, `sent`, `unread_count`) |
+| `GET /api/messages/:id` · `/:id/original` | read one message / original thread |
+| `POST /api/messages/:id/reply` | `{content}` reply |
+| `GET /api/blood-requests/mine` | my blood requests |
+| `POST /api/blood-requests/:id/fulfill` · `/:id/cancel` | manage own request |
+| `POST /api/uploads` | generic image upload (multipart `file`) |
+
+### Admin
+
+| Method & path | Description |
+| --- | --- |
+| `GET /api/admin/dashboard` | stats, recent orders/users, low stock |
+| `GET /api/admin/activity` · `POST /api/admin/activity/announce` | live feed + `{title, detail, link}` announcement |
+| `GET /api/admin/settings` · `POST` | site settings (secrets masked with `••••••••`) |
+| `GET /api/admin/branding` · `POST` | logo/favicon (multipart) |
+| `GET /api/admin/smtp` · `POST` · `/smtp/test` · `/smtp/log` | mail settings + test + send log |
+| `GET/POST /api/admin/content/antid` · `PUT/DELETE /:id` | Anti-D content manager |
+| `GET/POST /api/admin/content/resources` · `PUT/DELETE /:id` | resource manager |
+| `POST /api/admin/notice` · `GET /api/admin/notice/clear` | site notice bar |
+| `GET/POST /api/admin/products` · `PUT/DELETE /api/admin/products/:id` | product management (multipart `image`) |
+| `GET /api/admin/orders` · `GET /:id` | orders (`?status=`) |
+| `POST/PATCH /api/admin/orders/:id/status` | status lifecycle (cancel restocks) |
+| `POST /api/admin/orders/:id/confirm-payment` | confirm payment |
+| `GET /api/admin/blood-requests/:id` · `PATCH /:id/status` · `DELETE /:id` | moderate requests |
+| `POST /api/admin/verify-donor/:id` | donor verification |
+| `POST /api/admin/promote/:id` · `/demote/:id` | role management (super admin) |
+| `GET /api/admin/user/details/:id` · `POST /api/admin/user/update/:id` · `DELETE /api/admin/user/:id` | user administration (self/super-admin guards) |
+| `POST /api/admin/create-admin` | create an admin account (super admin) |
+| `POST /api/admin/impersonate/:id` · `/switch-back` | support impersonation (`{impersonated_user_id}` to switch back) |
+| `GET /api/admin/backup` | Turso backup notice |
+| `GET /api/messages/admin/list` · `POST /api/messages/admin/reply/:id` | desk inbox + reply |
+| `GET /api/reviews/admin` · `POST /:id/status` · `/:id/feature` · `/:id/reply` · `DELETE /:id` | review moderation |
+| `GET /api/support/admin/sessions` · `/sessions/:key/messages` · `/sessions/:key/reply` · `/sessions/:key/close` · `/admin/stream` | live chat inbox |
+| `GET/POST /api/ai/admin/config` · `/admin/test` · `/admin/models` · `/admin/conversations` · `/admin/knowledge` | AI assistant settings + transcripts |
 
 ### Error codes
 
 | Status | Code (examples) |
 | --- | --- |
-| 400 | `VALIDATION_ERROR`, `BAD_JSON`, `BAD_BLOOD_GROUP`, `UPLOAD_ERROR` |
+| 400 | `VALIDATION_ERROR`, `BAD_JSON`, `BAD_BLOOD_GROUP`, `UPLOAD_ERROR`, `PROTECTED_USER` |
 | 401 | `UNAUTHENTICATED`, `BAD_CREDENTIALS`, `SESSION_INVALID`, `LOGIN_REQUIRED` |
 | 403 | `CORS_NOT_ALLOWED`, `FORBIDDEN`, `ADMIN_ONLY`, `SUPER_ADMIN_ONLY`, `OWN_ORDERS_ONLY` |
 | 404 | `NOT_FOUND`, `USER_NOT_FOUND`, `PRODUCT_NOT_FOUND`, `ORDER_NOT_FOUND` |
-| 409 | `EMAIL_TAKEN`, `CONFLICT`, `SLUG_TAKEN`, `STOCK_CHANGED`, `REVIEW_TOO_SOON`, `NO_PRIOR_ORDER` |
+| 409 | `EMAIL_TAKEN`, `CONFLICT`, `SLUG_TAKEN`, `STOCK_CHANGED`, `REVIEW_TOO_SOON`, `NO_PRIOR_ORDER`, `ORDER_NOT_CANCELLABLE` |
 | 413 | `PAYLOAD_TOO_LARGE` |
 | 422 | `UNPROCESSABLE`, `EMPTY_CART`, `OUT_OF_STOCK`, `DELIVERY_AREA_NOT_SERVED` |
 | 429 | `RATE_LIMITED` |
@@ -234,20 +258,21 @@ Base: `/api` — errors always return `{ error: { code, message, details? } }`.
 | `npm run dev` | local server (tsx, same app as prod) |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run build` | compile to `dist/` |
+| `npm run test:contract` | self-contained end-to-end contract suite (spawns the app on port 4100 with a throwaway DB) |
 | `npm run db:init` | apply schema + seeds (idempotent) |
 | `npm run db:backup` | dump tables to `data/backup-*.json` (dev) |
 | `npm run make-defaults` | regenerate default product images |
 
-## Verification performed
+## Verification
 
-- `tsc --noEmit` and `tsc` build: **0 errors**
-- `typeof import("./dist/server.js").default === "function"`: **true** (valid
-  Vercel Functions export, no `app.listen` in the module)
-- End-to-end suite against a fresh database: health, bootstrap, register/
-  login/logout, session persistence across restart, admin authorization,
-  full shop flow (cart → order → stock 50→48 → status lifecycle), over-qty
-  rejection with zero ghost orders, delivery-area + empty-cart 422s, blood
-  request field mapping + fulfilment, review moderation, message inbox/reply,
-  chat send/poll/admin reply, AI 503-when-unconfigured + preview, activity
-  feed, upload byte-exact round-trip on both mounts, CORS allow + 403 deny,
-  429 rate limiting — **all green**.
+Run `npm run typecheck && npm run build && npm run test:contract` — the
+contract suite boots the real app against a scratch database and walks the
+whole public contract (123 checks): health/meta, auth incl. first-account
+super-admin + token rotation/revocation, profile self-service, shop
+(catalogue → categories → cart → checkout → admin status lifecycle →
+owner-cancel with restock → double-cancel 409), delivery-area and empty-cart
+guards, blood requests (guest + user lifecycle + admin moderation), support
+inbox with replies, review moderation, live chat (visitor + admin side), AI
+endpoints (503 when unconfigured + admin config surface), uploads, and every
+admin panel route. CI-friendly: exit code 0 only when all checks pass.
+

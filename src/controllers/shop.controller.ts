@@ -18,6 +18,12 @@ export async function getProduct(req: Request, res: Response): Promise<void> {
   res.json(await shopService.productDetail(req.params.id));
 }
 
+/** GET /api/shop/categories — live category list with counts. */
+export async function listCategories(_req: Request, res: Response): Promise<void> {
+  res.json(await shopService.categories());
+}
+
+
 /** POST /api/shop/cart/validate-item — {product_id}. */
 export async function validateItem(req: Request, res: Response): Promise<void> {
   const product_id = str(req.body.product_id) || str(req.body.id);
@@ -57,6 +63,12 @@ export async function myOrders(req: Request, res: Response): Promise<void> {
 export async function getOrder(req: Request, res: Response): Promise<void> {
   if (!req.user) throw ApiError.unauthorized();
   res.json(await shopService.orderDetail(req.user, req.params.id));
+}
+
+/** POST /api/shop/orders/:id/cancel — owner cancels while pending (restocks). */
+export async function cancelOrder(req: Request, res: Response): Promise<void> {
+  if (!req.user) throw ApiError.unauthorized();
+  res.json({ success: true, ...(await shopService.cancelOwnOrder(req.user, req.params.id)) });
 }
 
 // ---------- reviews (user-facing) ----------

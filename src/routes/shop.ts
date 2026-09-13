@@ -7,12 +7,14 @@ import { singleUpload } from "../uploads/uploads.js";
 import {
   listProducts,
   getProduct,
+  listCategories,
   validateItem,
   resolveCart,
   checkoutContext,
   placeOrder,
   myOrders,
   getOrder,
+  cancelOrder,
   submitReview,
   listAdminProducts,
   createProduct,
@@ -29,6 +31,7 @@ const router = Router();
 // ---- public shop ----
 router.get("/products", ah(listProducts));
 router.get("/products/:id", ah(getProduct));
+router.get("/categories", ah(listCategories));
 router.post("/cart/validate-item", rateLimit({ scope: "cart-validate", windowMs: 60 * 1000, max: 120 }), ah(validateItem));
 router.post("/cart/resolve", rateLimit({ scope: "cart-resolve", windowMs: 60 * 1000, max: 120 }), ah(resolveCart));
 
@@ -37,6 +40,7 @@ router.get("/checkout/context", requireAuth, ah(checkoutContext));
 router.post("/orders", requireAuth, rateLimit({ scope: "order-place", windowMs: 15 * 60 * 1000, max: 10 }), ah(placeOrder));
 router.get("/orders/mine", requireAuth, ah(myOrders));
 router.get("/orders/:id", requireAuth, ah(getOrder));
+router.post("/orders/:id/cancel", requireAuth, ah(cancelOrder));
 
 // ---- reviews (user-facing; also /api/reviews) ----
 router.post("/reviews", requireAuth, ah(submitReview));

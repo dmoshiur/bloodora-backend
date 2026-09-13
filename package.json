@@ -14,7 +14,8 @@
     "build": "tsc",
     "db:init": "tsx src/db-cli.ts init",
     "db:backup": "tsx src/db-cli.ts backup",
-    "make-defaults": "node scripts/make-defaults.mjs"
+    "make-defaults": "node scripts/make-defaults.mjs",
+    "test:contract": "node tests/contract.mjs"
   },
   "dependencies": {
     "@libsql/client": "^0.15.15",

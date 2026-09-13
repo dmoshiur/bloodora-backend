@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import { Router } from "express";
 import { ah } from "../utils/async.js";
 import { str } from "../utils/validate.js";
+import { optionalAuth } from "../middleware/auth.js";
 import { metaService } from "../services/meta.service.js";
 
 const router = Router();
@@ -10,6 +11,20 @@ const router = Router();
 router.get("/", ah(async (_req: Request, res: Response) => {
   res.json(await metaService.get());
 }));
+
+// GET /api/meta/chat-auth — identity for the live chat widget. Logged-in
+// visitors get their account identity; guests get a stable per-IP guest id so
+// the widget can keep a thread across reloads.
+router.get("/chat-auth", optionalAuth, ah(async (req: Request, res: Response) => {
+  const u = req.user;
+  if (u) {
+    res.json({ uid: String(u.id), name: u.name, image: u.image_file || "default.jpg", is_admin: Boolean(u.is_admin) });
+    return;
+  }
+  const ip = String(req.ip || "").replace(/\./g, "");
+  res.json({ uid: `guest_${ip}`, name: "Guest User", image: "default.jpg", is_admin: false });
+}));
+
 
 // GET /api/meta/settings
 router.get("/settings", ah(async (_req: Request, res: Response) => {

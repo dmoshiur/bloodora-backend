@@ -11,6 +11,7 @@ const donorRouter = Router();
 donorRouter.get("/", ah(listDonors));
 
 // ---------- /api/users ----------
+router.get("/:id/public", ah(publicProfile)); // lightweight alias kept for the original contract
 router.get("/:id", ah(publicProfile));
 router.put("/me", requireAuth, singleUpload("profile_pic"), ah(updateSelf));
 router.post("/me/toggle-status", requireAuth, ah(toggleStatus));
