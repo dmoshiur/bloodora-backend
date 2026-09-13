@@ -56,12 +56,20 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     message = err;
   }
 
-  if (status >= 500) {
+  // Log levels distinguish "we chose to fail" from "something broke".
+  //
+  // An ApiError is a deliberate domain decision (DB not ready, AI unconfigured,
+  // delivery area not served). Logging those at `error` with a stack — as this
+  // handler used to — buried the genuinely unexpected failures in noise during
+  // exactly the debugging session where the signal mattered most.
+  if (status >= 500 && !(err instanceof ApiError)) {
     logger.error("unhandled error", {
       path: req.originalUrl,
       method: req.method,
       err: err instanceof Error ? { message: err.message, stack: err.stack } : String(err),
     });
+  } else if (status >= 500) {
+    logger.warn("service unavailable", { path: req.originalUrl, method: req.method, status, code, message });
   } else if (status === 401 || status === 403) {
     logger.warn("auth rejection", { path: req.originalUrl, status, code });
   }

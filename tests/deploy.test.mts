@@ -158,6 +158,103 @@ try {
 }
 step("the handler runs a request without throwing synchronously", threw === null, threw ?? "");
 
+// -------------- hang prevention: the "stuck loading forever" guard --------------
+//
+// The production failure this section pins was NOT a crash and NOT a bad export.
+// It was two independent ways for a request to never complete:
+//
+//   (a) the cold-start bootstrap issued 451 sequential libSQL round trips, which
+//       at any realistic Turso RTT outlives the platform's function maxDuration —
+//       so the invocation was killed mid-bootstrap, the instance discarded, and
+//       the next request started the same 451-statement walk from zero. It never
+//       converged: the API "loaded" forever and never served a single response.
+//   (b) @libsql/client has NO internal timeout (verified: zero AbortSignal/
+//       setTimeout references in its http/node/web transports), and every layer
+//       above it awaited it unbounded. An unreachable Turso host therefore hung
+//       even GET /api/health indefinitely — reproduced as `curl -m 15 → 000`.
+//
+// Each assertion below removes one of the properties whose absence allowed that.
+
+const timeoutMod = code(read("src/db/timeout.ts"));
+step("src/db/timeout.ts exists", timeoutMod.length > 0);
+step("withTimeout() unrefs its timer (never keeps an instance alive)", /unref/.test(timeoutMod));
+step("timedFetch() aborts the socket, not just the wait", /AbortController/.test(timeoutMod) && /controller\.abort\(\)/.test(timeoutMod));
+
+// (b) transport-level deadline — the only hook libSQL exposes for one.
+const clientSrc = code(read("src/db/client.ts"));
+step("getClient() bounds the libSQL transport with a timed fetch", /fetch:\s*timedFetch/.test(clientSrc));
+step("the database URL is logged without credentials", /safeHost/.test(clientSrc) && !/tursoAuthToken/.test(clientSrc.slice(clientSrc.indexOf("logger.info"))));
+
+// Every query helper goes through one bounded choke point.
+const querySrc = code(read("src/db/query.ts"));
+step("query.ts exposes batch() — one round trip per statement group", /export async function batch/.test(querySrc));
+step("single statements are bounded", /bounded\(getClient\(\)\.execute/.test(querySrc));
+step("batches are bounded", /bounded\(\s*getClient\(\)\.batch/.test(querySrc));
+step("transaction open/commit/rollback are all bounded", (querySrc.match(/bounded\(tx\.|bounded\(getClient\(\)\.transaction/g) || []).length >= 4, String((querySrc.match(/bounded\(/g) || []).length));
+
+// (a) the schema stage must not cost one request per statement.
+const schemaSrc = code(read("src/db/schema.ts"));
+const applySchema = schemaSrc.slice(schemaSrc.indexOf("export async function applySchema"));
+step("applySchema() sends the DDL as ONE batch", /await batch\(DDL\)/.test(applySchema));
+step("applySchema() does NOT loop `await run()` per DDL statement", !/for \(const stmt of DDL\) \{\s*await run/.test(applySchema));
+step("applySchema() discovers migrated columns in ONE batched PRAGMA", /await batch\(tables\.map/.test(applySchema));
+step("applySchema() issues ALTERs only for genuinely missing columns", /alters\.length > 0/.test(applySchema));
+step("applySchema() writes settings defaults as ONE batch", /SETTINGS_DEFAULTS\)\.map/.test(applySchema));
+
+// (a) the bootstrap must be bounded, shared, and skippable when warm.
+const initSrc = code(read("src/db/init.ts"));
+step("ensureDbReady() bounds the WAIT without abandoning the work", /withDeadline\(startBootstrap\(\)/.test(initSrc));
+step("the bootstrap is memoized — one run per instance, never duplicated", /if \(!bootstrapping\)/.test(initSrc));
+step("a failed bootstrap is backed off instead of retried per request", /BOOT_RETRY_BACKOFF_MS/.test(initSrc));
+step("a warm database can skip seeding entirely", /catalogueFingerprint/.test(initSrc) && /BOOTSTRAP_MARKER/.test(initSrc));
+step("seeders are batched, not one request per row", !/for \(const \[filename, b64\] of Object\.entries\(DEFAULT_IMAGES\)\) \{\s*const existing/.test(code(read("src/db/seed.ts"))));
+step("RBAC catalogue seeding reads state in one batch", /await batch\(\[`SELECT \* FROM roles`/.test(code(read("src/repos/role.repo.ts"))));
+
+// (b) the health probe must be answerable without the database.
+const healthRaw = read("src/controllers/health.controller.ts");
+step("the health probe is bounded by its own deadline", /withTimeout\(/.test(code(healthRaw)));
+step("health reports the database state explicitly", /database: "connected" \| "unavailable"|database,/.test(healthRaw));
+step("health keeps the legacy `db` field the contract suite reads", /db: ok \? "ok" : "error"/.test(healthRaw));
+
+const appSrc = code(read("src/app.ts"));
+step("probes bypass the session middleware (no DB read before the health route)", /isProbePath\(req\)/.test(appSrc) && /sessionMiddleware\(req, res, next\)/.test(appSrc));
+step("probes bypass the DB bootstrap middleware", /if \(isProbePath\(req\)\) \{\s*next\(\);\s*return;\s*\}/.test(appSrc));
+step("a request-level failsafe is mounted before the routes", /app\.use\(requestTimeout\)/.test(appSrc) && appSrc.indexOf("app.use(requestTimeout)") < appSrc.indexOf('app.use("/api"'));
+step("boot stages are logged for root-cause debugging", /\[BOOT\]/.test(read("src/app.ts")));
+
+const rtSrc = code(read("src/middleware/requestTimeout.ts"));
+step("the failsafe only fires when nothing has been written yet", /res\.headersSent/.test(rtSrc));
+step("the failsafe answers 504 instead of leaving the socket open", /504/.test(rtSrc) && /REQUEST_TIMEOUT/.test(rtSrc));
+step("the failsafe never keeps an instance alive", /unref/.test(rtSrc));
+step("request logging never includes bodies, cookies or query strings", /split\("\?"\)\[0\]/.test(rtSrc) && !/req\.body/.test(rtSrc) && !/req\.headers\.cookie/.test(rtSrc));
+
+// (b) the session store sits BEFORE the router, so it must fail fast and open.
+const storeSrc = code(read("src/sessions/tursoStore.ts"));
+step("every session-store operation is bounded", (storeSrc.match(/this\.bounded\(/g) || []).length >= 5, String((storeSrc.match(/this\.bounded\(/g) || []).length));
+step("a failed session read degrades to 'no session', never a hang", /cb\(null, undefined\)/.test(storeSrc));
+step("a failed session write still completes the request", /cb\(\);/.test(storeSrc));
+// code() strips comments on purpose: both files *document* the MemoryStore
+// warning they avoid, and matching the raw text would flag the note as the bug.
+step("no MemoryStore anywhere in the app or the store", !/MemoryStore/.test(code(read("src/app.ts"))) && !/MemoryStore/.test(code(read("src/sessions/tursoStore.ts"))));
+
+// (b) every external call is bounded too.
+const aiSrc = code(read("src/services/ai.service.ts"));
+step("the AI service has exactly one bare fetch() — inside its own timeout helper", (aiSrc.match(/await fetch\(/g) || []).length === 1, String((aiSrc.match(/await fetch\(/g) || []).length));
+step("the AI admin round-trips use the bounded helper", (aiSrc.match(/fetchWithTimeout\(/g) || []).length >= 3, String((aiSrc.match(/fetchWithTimeout\(/g) || []).length));
+step("the AI timeout is configurable, not hardcoded", /config\.aiTimeoutMs/.test(aiSrc) && !/abort\(\), 60000\)/.test(aiSrc));
+
+const smtpSrc = code(read("src/services/smtp.service.ts"));
+step("the SMTP transport sets connect/greeting/socket deadlines", /connectionTimeout/.test(smtpSrc) && /greetingTimeout/.test(smtpSrc) && /socketTimeout/.test(smtpSrc));
+
+const sseSrc = code(read("src/utils/sse.ts"));
+step("SSE streams end themselves before the platform kills the function", /sseMaxMs/.test(sseSrc) && /max stream lifetime reached/.test(sseSrc));
+step("SSE timers are unref'd and torn down on every close path", /unref/.test(sseSrc) && /onClose/.test(sseSrc));
+step("no SSE endpoint hand-rolls its own interval any more", !/setInterval/.test(code(read("src/routes/meta.ts"))) && !/setInterval/.test(code(read("src/controllers/support.controller.ts"))));
+
+// Local dev must not block on the database either.
+const devSrc = code(read("src/dev.ts"));
+step("src/dev.ts opens its port BEFORE warming the database", devSrc.indexOf("app.listen(") < devSrc.indexOf("bootstrapDatabase()"));
+
 // ---------------- package / build sanity ----------------
 
 const pkg = JSON.parse(read("package.json"));
@@ -171,6 +268,10 @@ step(".env.example documents TURSO_DATABASE_URL", /TURSO_DATABASE_URL/.test(envE
 step(".env.example documents JWT_SECRET", /JWT_SECRET/.test(envExample));
 step(".env.example documents FRONTEND_URL", /FRONTEND_URL/.test(envExample));
 step(".env.example documents the SMTP variables the outbox needs", /SMTP_HOST/.test(envExample) && /SMTP_ENABLED/.test(envExample));
+step(".env.example documents the deadline knobs", ["DB_TIMEOUT_MS", "DB_BOOTSTRAP_TIMEOUT_MS", "HEALTH_DB_TIMEOUT_MS", "REQUEST_TIMEOUT_MS", "AI_TIMEOUT_MS", "SSE_MAX_MS"].every((k) => envExample.includes(k)), "missing a timeout variable");
+step(".env.example documents no secret VALUES", !/(eyJ|sk-[A-Za-z0-9]{10}|-----BEGIN)/.test(envExample));
+step("a production-path e2e suite exists", typeof pkg.scripts?.["test:e2e"] === "string", JSON.stringify(Object.keys(pkg.scripts || {})));
+step("the aggregate test script runs the e2e suite", /test:e2e/.test(pkg.scripts?.test ?? ""));
 
 console.log(`\n=== ${pass} passed, ${failures.length} failed ===`);
 if (failures.length) {

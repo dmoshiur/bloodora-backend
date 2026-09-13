@@ -12,6 +12,7 @@ import { languageMiddleware } from "./middleware/language.js";
 import apiRouter from "./routes/index.js";
 import { serveUpload } from "./controllers/upload.controller.js";
 import { errorHandler, notFoundHandler } from "./middleware/error.js";
+import { requestTimeout } from "./middleware/requestTimeout.js";
 import { ah } from "./utils/async.js";
 
 /**
@@ -67,11 +68,37 @@ const helmet: HelmetMiddleware = (() => {
   return resolved;
 })();
 
+/**
+ * Paths that must be answerable without touching Turso, the session store or the
+ * language settings — i.e. the platform's liveness probes and the health check.
+ *
+ * Matching on the *original* URL only (never a rewritten/mounted path) keeps this
+ * honest: it is exactly what the client asked for.
+ */
+export function isProbePath(req: { path?: string; originalUrl?: string; url?: string }): boolean {
+  const url = String(req.originalUrl ?? req.url ?? "").split("?")[0];
+  return url === "/" || url === "/health" || url === "/api/health" || url === "/favicon.ico" || url === "/favicon.png" || url.endsWith("/health");
+}
+
 function createApp(): express.Express {
+  const bootStarted = Date.now();
+  const stage = (msg: string, fields?: Record<string, unknown>) =>
+    logger.info(`[BOOT] ${msg}`, { ...(fields ?? {}), sinceStartMs: Date.now() - bootStarted });
+
+  stage("loading configuration", {
+    env: config.nodeEnv,
+    origins: config.frontendOrigins.length,
+    db: config.tursoDatabaseUrl ? "remote" : "local-file",
+  });
+
   const app = express();
 
   app.disable("x-powered-by");
   app.set("trust proxy", 1); // behind Vercel's edge / LBs
+
+  // Outer failsafe + request accounting. Mounted FIRST so every request — including
+  // the probes — is logged and bounded; see middleware/requestTimeout.ts.
+  app.use(requestTimeout);
 
   // Platform probes and browser asset requests must never depend on Turso,
   // sessions, or any other external service. Keep these routes before all
@@ -87,6 +114,8 @@ function createApp(): express.Express {
   };
   app.get(["/", "/health"], liveness);
   app.get(["/favicon.ico", "/favicon.png"], (_req, res) => res.status(204).end());
+
+  stage("registering middleware");
 
   // Structured HTTP access logs (request line only — no bodies, no cookies).
   app.use(
@@ -131,23 +160,35 @@ function createApp(): express.Express {
   app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
   // Persistent sessions — Turso-backed store, never MemoryStore.
-  app.use(
-    session({
-      name: "connect.sid",
-      store: new TursoSessionStore(),
-      secret: config.jwtSecret || "dev-session-secret",
-      resave: false,
-      saveUninitialized: false,
-      rolling: true,
-      cookie: {
-        httpOnly: true,
-        secure: config.cookieSecure,
-        sameSite: "lax",
-        domain: config.cookieDomain || undefined,
-        maxAge: config.jwtTtlDays * 24 * 3600 * 1000,
-      },
-    }),
-  );
+  //
+  // Wrapped so the probes bypass it entirely. express-session runs BEFORE the
+  // router, and for any request carrying a `connect.sid` cookie it calls
+  // `store.get()` — a database read. That put Turso back on the critical path of
+  // `GET /api/health` for every browser that had ever logged in, which is exactly
+  // the dependency the probe exists to report on. Skipping it for probes also
+  // removes the last way the health check could stall on the session store.
+  const sessionMiddleware = session({
+    name: "connect.sid",
+    store: new TursoSessionStore(),
+    secret: config.jwtSecret || "dev-session-secret",
+    resave: false,
+    saveUninitialized: false,
+    rolling: true,
+    cookie: {
+      httpOnly: true,
+      secure: config.cookieSecure,
+      sameSite: "lax",
+      domain: config.cookieDomain || undefined,
+      maxAge: config.jwtTtlDays * 24 * 3600 * 1000,
+    },
+  });
+  app.use((req, res, next) => {
+    if (isProbePath(req)) {
+      next();
+      return;
+    }
+    sessionMiddleware(req, res, next);
+  });
 
   // Every data API call (and stored-file serve) needs the DB ready exactly once.
   // Liveness endpoints intentionally bypass bootstrap: they must still answer
@@ -162,15 +203,25 @@ function createApp(): express.Express {
   // with 503 when Turso is down — exactly the opposite of what the probe is
   // for. Accept both forms.
   const dbReady = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const p = req.path;
-    const url = req.originalUrl.split("?")[0];
-    if (p === "/health" || p === "/api/health" || url === "/api/health" || url === "/health" || p.endsWith("/health")) {
+    if (isProbePath(req)) {
       next();
       return;
     }
     ensureDbReady()
       .then(() => next())
       .catch((err) => {
+        const shaped = err as { status?: number; code?: string; message?: string };
+        const alreadyShaped = shaped?.status === 503 && shaped?.code === "DB_NOT_READY";
+        // The breaker's rejection is already the right 503; log it once, quietly.
+        // Anything else is an unexpected failure and deserves the full report.
+        if (alreadyShaped) {
+          logger.warn("db: not ready — answering 503", {
+            path: req.originalUrl,
+            error: shaped.message ?? "unknown",
+          });
+          next(err);
+          return;
+        }
         logger.error("db: init failed", {
           error: err instanceof Error ? err.message : String(err),
           path: req.originalUrl,
@@ -184,14 +235,14 @@ function createApp(): express.Express {
   // supported Accept-Language, so it would trigger a settings read and make the
   // "is the database up?" endpoint depend on the database.
   const withLanguage = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const url = req.originalUrl.split("?")[0];
-    if (url === "/api/health" || url === "/health" || url.endsWith("/health")) {
+    if (isProbePath(req)) {
       next();
       return;
     }
     void languageMiddleware(req, res, next);
   };
 
+  stage("registering routes");
   app.use("/api", dbReady, withLanguage, apiRouter);
   // Root-level image serving (frontend references /uploads/<file> directly).
   // Wrapped in ah(): an unhandled async rejection here would crash the whole
@@ -201,6 +252,12 @@ function createApp(): express.Express {
   app.use(notFoundHandler);
   app.use(errorHandler);
 
+  stage("application ready", {
+    dbBootstrap: "lazy (first /api request)",
+    requestTimeoutMs: config.requestTimeoutMs,
+    dbTimeoutMs: config.dbTimeoutMs,
+    dbBootstrapTimeoutMs: config.dbBootstrapTimeoutMs,
+  });
   return app;
 }
 

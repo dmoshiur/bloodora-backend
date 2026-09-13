@@ -12,6 +12,27 @@ import type { AiConfig, AiMessage, AiResult, SafeUser } from "../types.js";
 
 const MAX_CONTEXT_MESSAGES = 12;
 
+/**
+ * `fetch` with a hard deadline.
+ *
+ * The chat completion path already aborted via AbortController, but the two admin
+ * round-trips (`/admin/test`, `/admin/models`) called bare `fetch()` with no
+ * signal at all — a Groq endpoint that accepted the connection and never replied
+ * would hold that request open until the platform killed the function. Both now
+ * share this helper.
+ */
+async function fetchWithTimeout(url: string, init: RequestInit, ms = config.aiTimeoutMs): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  timer.unref?.();
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const MAX_ANSWER_CHARS = 4000;
 
@@ -162,17 +183,18 @@ export const aiService = {
     let res: Response | null = null;
     let lastError: ApiError | null = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 60000);
       try {
-        res = await fetch(url, {
+        // Bounded by AI_TIMEOUT_MS (default 25 s) through the same helper the
+        // admin round-trips use, so this file contains exactly one bare fetch()
+        // and it is the one inside the timeout wrapper. A provider that stalls
+        // must produce a 504 the caller can see, not an open socket the platform
+        // has to kill. Keep AI_TIMEOUT_MS under the deployment's maxDuration.
+        res = await fetchWithTimeout(url, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
           body: payload,
-          signal: controller.signal,
         });
       } catch (err) {
-        clearTimeout(timer);
         if ((err as Error).name === "AbortError") {
           lastError = new ApiError(504, "AI_TIMEOUT", "The AI provider took too long to respond — please try again.");
         } else {
@@ -185,7 +207,6 @@ export const aiService = {
         }
         throw lastError;
       }
-      clearTimeout(timer);
 
       if (res.ok) break;
 
@@ -380,7 +401,7 @@ export const aiService = {
     const baseUrl = (str(body.base_url) || cfg.baseUrl).replace(/\/+$/, "");
     const started = Date.now();
     try {
-      const r = await fetch(`${baseUrl}/chat/completions`, {
+      const r = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
@@ -417,9 +438,12 @@ export const aiService = {
       return { success: true, models: MODEL_CHOICES, source: "static", note: "Add a Groq API key to fetch the live catalogue." };
     }
     try {
-      const r = await fetch(`${cfg.baseUrl.replace(/\/+$/, "")}/models`, {
-        headers: { Authorization: `Bearer ${cfg.apiKey}` },
-      });
+      const r = await fetchWithTimeout(
+        `${cfg.baseUrl.replace(/\/+$/, "")}/models`,
+        { headers: { Authorization: `Bearer ${cfg.apiKey}` } },
+        // The model catalogue is a small GET; it should never need the full budget.
+        Math.min(config.aiTimeoutMs, 10_000),
+      );
       const data = (await r.json()) as { data?: Array<{ id?: string }>; error?: { message?: string } };
       if (!r.ok) throw new Error(data?.error?.message || `HTTP ${r.status}`);
       const ids = (data?.data || []).map((m) => m.id).filter(Boolean) as string[];

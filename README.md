@@ -98,6 +98,7 @@ Required environment variables (all backend-only, never sent to the frontend):
 | `MAX_UPLOAD_MB` | optional per-image upload cap (default `4`; Vercel rejects request bodies over 4.5 MB) |
 | `GROQ_API_KEY`, `AI_*` | Live AI Help (admin panel can override) |
 | `SMTP_*` | transactional mail defaults — the Admin → SMTP panel overrides them once saved |
+| `DB_TIMEOUT_MS`, `DB_BATCH_TIMEOUT_MS`, `DB_BOOTSTRAP_TIMEOUT_MS`, `HEALTH_DB_TIMEOUT_MS`, `SESSION_TIMEOUT_MS`, `REQUEST_TIMEOUT_MS`, `AI_TIMEOUT_MS`, `SMTP_TIMEOUT_MS`, `SSE_MAX_MS` | deadlines — see [Reliability model](#reliability-model-why-no-request-can-hang). All optional; the defaults are tuned for a 10 s function budget |
 
 Production boot **fails fast** if any required variable is missing
 (`src/config/env.ts`). Set these values in the Vercel project settings for the
@@ -113,8 +114,16 @@ curl -i https://YOUR_PUBLIC_BACKEND_DOMAIN/
 # 200: {"name":"bloodora-backend","status":"ok",...}
 
 curl -i https://YOUR_PUBLIC_BACKEND_DOMAIN/api/health
-# 200 + db:"ok" when Turso is reachable; 503 + db:"error" otherwise
+# 200 {"success":true,"status":"ok","database":"connected","db":"ok",...}
+# 503 {"success":false,"status":"degraded","database":"unavailable","db":"error","dbError":"…"}
 ```
+
+`/api/health` is **guaranteed to answer**: it is exempt from the session
+middleware, the bootstrap middleware and the language middleware, and its own
+`SELECT 1` is bounded by `HEALTH_DB_TIMEOUT_MS` (1.5 s). A hung database
+produces a 503 in about 1.5 s, never an endless spinner. `database` is the
+explicit dependency verdict; `db` is the legacy alias the contract suite and the
+frontend proxy still read.
 
 `/` and `/health` only check that the function is reachable. `/api/health` also
 performs a live database query. If curl returns a Vercel login page or a 401
@@ -147,6 +156,110 @@ step — takes `index.d.cts`, where a default import binds to the whole
 `TS2349: This expression is not callable. Type 'typeof import("…/helmet/index")'
 has no call signatures`. The namespace form type-checks under both and is the
 same function at runtime either way.
+
+## Reliability model (why no request can hang)
+
+This section exists because the backend once deployed "successfully" and then
+served nothing: every request spun forever. A green Vercel build says the code
+compiled, not that a request can complete. Two independent defects caused it,
+and both are now structurally impossible.
+
+### 1. The cold start could not fit inside a function invocation
+
+The database bootstrap ran **451 sequential `execute()` calls** — 80 DDL, 56
+`PRAGMA table_info`, 45 settings inserts, 116 RBAC statements, 70 navigation
+inserts, 58 seed reads/writes. Against a *remote* Turso database every one of
+those is a separate HTTPS request. Measured with an injected RTT:
+
+| Turso RTT | First request, before | First request, now |
+| --- | --- | --- |
+| 20 ms | 5.3 s | **0.52 s** |
+| 50 ms | 18.3 s ❌ | **1.18 s** |
+| 80 ms | 39.1 s ❌ | **1.83 s** |
+| 120 ms | 70.3 s ❌ | **2.72 s** |
+
+Vercel Hobby's `maxDuration` is 10 s, so from 50 ms upward the invocation was
+killed mid-bootstrap, the instance discarded, and the *next* request restarted
+the same 451-statement walk from zero. It never converged — which is why the
+site loaded forever instead of failing once.
+
+Fixed by making round trips, not statements, the unit of cost:
+
+- **`batch()`** (`src/db/query.ts`) collapses a group of statements into **one**
+  HTTP request. `applySchema()` now costs at most 5; the seeders read "what
+  already exists?" in one query and write everything missing in one batch; RBAC
+  seeding is 3 requests regardless of catalogue size.
+- **A catalogue fingerprint** (`src/db/init.ts`) is stored in `settings`. A
+  database this build has already seeded answers it in one query and skips
+  seeding entirely, so a warm-database cold start is ~5 round trips. The
+  fingerprint is a hash of the permissions, roles, routes, products, images,
+  content and super-admin email in *code* — add any of them and the next boot
+  reconciles automatically, with no version to remember to bump.
+- **451 → 24 round trips** end to end, verified by `npm run bench:coldstart`.
+
+### 2. Nothing on the request path had a deadline
+
+`@libsql/client` implements **no timeout at all** — there is not a single
+`AbortSignal` or `setTimeout` in its `http`, `node` or `web` transports. A Turso
+host that accepted the TCP connection and then never answered made `execute()` a
+promise that never settled, and every layer above it awaited that promise
+unbounded. Reproduced exactly: `curl -m 15 /api/health` → `status=000`, no
+response, no log line, forever.
+
+Every blocking primitive is now bounded (`src/db/timeout.ts`):
+
+| Operation | Bound | On expiry |
+| --- | --- | --- |
+| libSQL HTTP transport | `timedFetch` → `AbortController`, `DB_TIMEOUT_MS` | socket aborted, `503 DB_TIMEOUT` |
+| single statement / batch / transaction step | `DB_TIMEOUT_MS` / `DB_BATCH_TIMEOUT_MS` | `503` |
+| whole cold-start bootstrap | `DB_BOOTSTRAP_TIMEOUT_MS` | `503 DB_NOT_READY`, **work continues in the background** |
+| `/api/health` probe | `HEALTH_DB_TIMEOUT_MS` | `503 database:"unavailable"` |
+| session-store read / write | `SESSION_TIMEOUT_MS` | read fails **open** (caller is logged out); write is best-effort |
+| AI provider call | `AI_TIMEOUT_MS` | `504 AI_TIMEOUT` |
+| SMTP connect / greeting / socket | `SMTP_TIMEOUT_MS` | mail fails, stays in the outbox |
+| any request | `REQUEST_TIMEOUT_MS` | `504 REQUEST_TIMEOUT`, only if nothing was written yet |
+| SSE stream lifetime | `SSE_MAX_MS` | stream ends cleanly before the platform kills it |
+
+Two details that matter:
+
+- `ensureDbReady()` bounds the **wait**, not the work. On expiry it rejects and
+  the shared bootstrap keeps running, so the first request answers 503 fast and
+  the second usually finds the database ready. Resetting the memo instead would
+  start a *second* concurrent bootstrap against the same database and make the
+  slow case slower.
+- A failed bootstrap is **backed off** for 5 s. Without that, every request
+  arriving during an outage restarted the bootstrap and waited out the full
+  deadline — measured as six consecutive 5 s waits where six 2 ms answers belong.
+
+### Nothing optional is initialized at startup
+
+`createApp()` opens no connection and touches no network: the app is built in
+~5 ms and exported. The database is initialized lazily on the first request
+that needs it. SMTP, the AI provider and mail are never connected at boot —
+they are resolved per use, behind a durable outbox, and their failure degrades
+one feature instead of the whole API. `/`, `/health`, `/api/health` and
+`/favicon.ico` are registered **before** every async middleware and are exempt
+from sessions, bootstrap and language resolution, so they answer even when
+Turso is completely down. That is what makes "the function is dead"
+distinguishable from "the function is up and its database is not".
+
+### Proving it, not assuming it
+
+```bash
+npm run test:e2e         # 65 checks against the REAL serverless entry, NODE_ENV=production
+npm run bench:coldstart  # cold-start latency vs Turso RTT; exits 1 if any exceeds the budget
+```
+
+`test:e2e` imports `api/index.ts` — the file Vercel actually runs — and drives
+it over a platform-owned socket with a hard deadline on every request, so a hang
+is a failure rather than a wait. It covers liveness, health, CORS (allow *and*
+reject), register/login/logout, bearer **and** cookie auth, user dashboard,
+admin dashboard, RBAC denial for a normal user, server-authoritative order
+pricing, the payment ledger, chat idempotency by `client_message_id`, SSE
+lifetime, a controlled AI failure, 404/400 envelopes and warm-path latency.
+The harness forwards `x-forwarded-proto: https` because Vercel's edge does, and
+without it express-session correctly refuses to emit a `Secure` cookie — a
+harness that omitted the header would "prove" login was broken.
 
 ## Security model
 
@@ -479,11 +592,13 @@ machine-readable part (e.g. `{product_id, requested, available}`).
 | `npm run dev` | local server (tsx, same app as prod) |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run build` | compile to `dist/` |
-| `npm run test` | every suite below, in order (deploy → AI → contract → v3) |
+| `npm run test` | every suite below, in order (deploy → e2e → AI → contract → v3) |
 | `npm run test:contract` | end-to-end **contract** suite — the endpoints the shipped frontend calls (spawns the app on port 4100 with a throwaway DB) |
 | `npm run test:v3` | end-to-end **v3 feature** suite — reset/verify flows, dashboard, notifications, ledger, strict pricing, RBAC, navigation, chat idempotency, rate limits (port 4200) |
 | `npm run test:ai` | unit tests for AI output sanitization (incl. streamed reasoning tags split across chunks) |
-| `npm run test:deploy` | deployment guard: `vercel.json` shape, entry exports, "only `dev.ts` listens", session store, documented env vars |
+| `npm run test:deploy` | deployment **and hang-prevention** guard: `vercel.json` shape, entry exports, "only `dev.ts` listens", session store, every deadline, batched bootstrap, probe independence, documented env vars |
+| `npm run test:e2e` | production-path end-to-end suite against the real serverless entry (`api/index.ts`), `NODE_ENV=production`, hard deadline per request |
+| `npm run bench:coldstart` | cold-start latency vs Turso RTT; exits non-zero if any first request exceeds the platform budget |
 | `npm run db:init` | apply schema + seeds (idempotent) |
 | `npm run db:backup` | dump tables to `data/backup-*.json` (dev) |
 | `npm run make-defaults` | regenerate default product images |
@@ -491,12 +606,14 @@ machine-readable part (e.g. `{product_id, requested, available}`).
 ## Verification
 
 ```bash
-npm run typecheck && npm run build && npm test     # 357 checks, exit 0 only when all pass
+npm run typecheck && npm run build && npm test     # 469 checks, exit 0 only when all pass
+npm run bench:coldstart                            # must stay inside the 10 s function budget
 ```
 
 | Suite | Checks | What it covers |
 | --- | --- | --- |
-| `test:deploy` | 32 | `vercel.json` shape (no legacy `routes`, one rewrite, no non-entrypoint functions), default-exported handler, nothing but `dev.ts` listens, Turso session store, documented env vars |
+| `test:deploy` | 79 | `vercel.json` shape (no legacy `routes`, one rewrite, no non-entrypoint functions), default-exported handler, nothing but `dev.ts` listens, Turso session store, documented env vars — **plus** the hang-prevention invariants: transport deadline injected into libSQL, every query/batch/transaction step bounded, `applySchema()` batched rather than one request per statement, bootstrap memoized + backed off + skippable when warm, health/session/bootstrap probes independent of the database, request failsafe mounted first, AI/SMTP/SSE deadlines, no MemoryStore |
+| `test:e2e` | 65 | the production path itself: imports `api/index.ts` and drives it over a platform-owned socket in `NODE_ENV=production` with a hard per-request deadline (a hang is a failure). Liveness, health envelope, CORS allow + reject, register/login/logout, bearer and cookie auth, secure-cookie emission behind the forwarded-proto edge, user dashboard, admin dashboard, RBAC denial for a normal user, server-authoritative order pricing, payment ledger + admin confirm, chat idempotency by `client_message_id`, SSE self-termination, controlled AI failure, 404/400 envelopes, warm-path latency |
 | `test:ai` | 31 | reasoning-block removal (paired / unterminated / stray / case-insensitive / every tag name), provider `reasoning*` fields never read, streamed tags split across chunks, clean text untouched |
 | `test:contract` | 125 | the contract the shipped frontend calls: health/meta, auth incl. first-account super-admin + token rotation/revocation, profile self-service, shop (catalogue → cart → checkout → admin lifecycle → owner-cancel with restock → double-cancel 409), blood requests, support inbox, review moderation, live chat, AI (503 when unconfigured), uploads, every admin route |
 | `test:v3` | 169 | everything added on top: health envelope, backend i18n (`?lang=`, `Accept-Language`, saved preference), forgot/reset password and email verification **driven end-to-end by reading the link out of the mail outbox**, personal dashboard, notifications (feed, badges, read/read-all/delete, per-account isolation, channel opt-out), payment ledger (idempotent confirm, single refund, cancelled-order guards), server-authoritative pricing (client prices ignored, stock enforced, delivery fee from settings, restock exactly once), RBAC (seeded roles, custom role, denials, self-lockout/self-demote guards, audit trail), navigation CRUD/ordering/visibility, chat idempotency, shared rate limiting with `Retry-After`, activity SSE cursor |

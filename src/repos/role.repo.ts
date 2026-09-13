@@ -1,4 +1,4 @@
-import { all, get, run } from "../db/query.js";
+import { all, batch, get, run } from "../db/query.js";
 import { nowIso } from "../utils/time.js";
 import { randomId } from "../utils/errors.js";
 import { PERMISSIONS, ROLES } from "../data/permissions.js";
@@ -111,30 +111,74 @@ export const roleRepo = {
    * everything the catalogue lists" would silently undo an admin's decision on
    * every deploy.
    */
+  /**
+   * Seed/reconcile the role + permission catalogue in THREE round trips
+   * (upsert permissions → read current state → write the delta), regardless of
+   * catalogue size.
+   *
+   * The previous implementation issued one statement per permission, per role,
+   * per existing grant lookup and per individual grant — ~116 sequential HTTPS
+   * requests to Turso on every cold start. That alone could exceed a serverless
+   * function's maxDuration, so the first request was killed before it could
+   * answer and the API never became reachable.
+   *
+   * Semantics are unchanged: display metadata always follows the catalogue, while
+   * grants are only ever ADDED for keys a previous deploy seeded and an admin has
+   * not since revoked (`seeded_permissions` is the record of what we last wrote).
+   */
   async seedCatalogue(): Promise<{ roles: number; permissions: number; granted: number }> {
-    let permissions = 0;
-    for (const p of PERMISSIONS) {
-      const { changes } = await run(
-        `INSERT INTO permissions (id, key, name, group_name, description) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(key) DO UPDATE SET name = excluded.name, group_name = excluded.group_name, description = excluded.description`,
-        [randomId(), p.key, p.name, p.group, p.description],
-      );
-      permissions += changes > 0 ? 1 : 0;
+    // (1) Permission definitions follow the code; one request upserts them all.
+    await batch(
+      PERMISSIONS.map(
+        (p) =>
+          [
+            `INSERT INTO permissions (id, key, name, group_name, description) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(key) DO UPDATE SET name = excluded.name, group_name = excluded.group_name, description = excluded.description`,
+            [randomId(), p.key, p.name, p.group, p.description],
+          ] as [string, unknown[]],
+      ),
+    );
+
+    // (2) Read every existing role and every current grant in one request.
+    const read = await batch([`SELECT * FROM roles`, `SELECT role_key, permission_key FROM role_permissions`]);
+    const existingRoles = new Map<string, RoleRow>();
+    for (const r of (read[0]?.rows ?? []) as unknown as RoleRow[]) existingRoles.set(r.key, r);
+    const currentGrants = new Map<string, Set<string>>();
+    for (const g of (read[1]?.rows ?? []) as unknown as Array<{ role_key: string; permission_key: string }>) {
+      const set = currentGrants.get(g.role_key) ?? new Set<string>();
+      set.add(g.permission_key);
+      currentGrants.set(g.role_key, set);
     }
 
+    // (3) Compute the delta, then apply all of it in a single request.
+    const writes: Array<[string, unknown[]]> = [];
     let roles = 0;
     let granted = 0;
+
+    const grantStmt = `INSERT INTO role_permissions (role_key, permission_key) VALUES (?, ?) ON CONFLICT DO NOTHING`;
+
     for (const r of ROLES) {
-      const existing = await this.getRole(r.key);
+      const existing = existingRoles.get(r.key);
+      const wanted = [...new Set(r.permissions)];
+
       if (!existing) {
-        await this.createRole({ key: r.key, name: r.name, description: r.description, level: r.level, isSystem: true });
-        await this.replaceRolePermissions(r.key, r.permissions);
-        await this.setSeededPermissions(r.key, r.permissions);
+        writes.push([
+          `INSERT INTO roles (id, key, name, description, level, is_system, seeded_permissions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [randomId(), r.key, r.name, r.description ?? null, r.level ?? 1, 1, JSON.stringify(wanted), nowIso()],
+        ]);
+        for (const p of wanted) {
+          writes.push([grantStmt, [r.key, p]]);
+          granted += 1;
+        }
         roles += 1;
         continue;
       }
+
       // Display metadata follows the catalogue; grants do not.
-      await this.updateRole(r.key, { name: r.name, description: r.description, level: r.level });
+      writes.push([
+        `UPDATE roles SET name = COALESCE(?, name), description = COALESCE(?, description), level = COALESCE(?, level) WHERE key = ?`,
+        [r.name, r.description ?? null, r.level ?? null, r.key],
+      ]);
 
       let previouslySeeded: string[] = [];
       try {
@@ -142,22 +186,31 @@ export const roleRepo = {
       } catch {
         previouslySeeded = [];
       }
-      const current = await this.permissionsForRole(r.key);
-      if (current.length === 0 && previouslySeeded.length === 0) {
+      const current = currentGrants.get(r.key) ?? new Set<string>();
+
+      if (current.size === 0 && previouslySeeded.length === 0) {
         // First seed against a pre-existing role row (or a wiped grant table).
-        await this.replaceRolePermissions(r.key, r.permissions);
-        granted += r.permissions.length;
+        writes.push([`DELETE FROM role_permissions WHERE role_key = ?`, [r.key]]);
+        for (const p of wanted) {
+          writes.push([grantStmt, [r.key, p]]);
+          granted += 1;
+        }
       } else {
-        const added = r.permissions.filter((p) => !previouslySeeded.includes(p));
-        for (const p of added) {
-          if (!current.includes(p)) {
-            await this.grantPermission(r.key, p);
+        // Only keys this deploy newly added, and only where not already granted:
+        // an admin's revocation of an older key stays revoked.
+        for (const p of wanted.filter((k) => !previouslySeeded.includes(k))) {
+          if (!current.has(p)) {
+            writes.push([grantStmt, [r.key, p]]);
             granted += 1;
           }
         }
       }
-      await this.setSeededPermissions(r.key, r.permissions);
+
+      writes.push([`UPDATE roles SET seeded_permissions = ? WHERE key = ?`, [JSON.stringify(wanted), r.key]]);
     }
-    return { roles, permissions, granted };
-  },
+
+    if (writes.length > 0) await batch(writes);
+    return { roles, permissions: PERMISSIONS.length, granted };
+  }
+,
 };
