@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import { authService } from "../services/auth.service.js";
 import { bearer } from "./auth.js";
+import { applyUserLanguage } from "./language.js";
 import type { SafeUser } from "../types.js";
 
 /**
@@ -17,6 +18,7 @@ async function ensureUser(req: Request): Promise<SafeUser | null> {
   if (!user) return null;
   req.user = user;
   req.isAdminClaim = user.role !== "user";
+  applyUserLanguage(req, user.language);
   return user;
 }
 

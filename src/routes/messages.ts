@@ -2,7 +2,7 @@ import { Router } from "express";
 import { ah } from "../utils/async.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import { requireAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/admin.js";
+import { requirePermission } from "../middleware/rbac.js";
 import {
   inbox,
   send,
@@ -22,7 +22,7 @@ router.get("/:id/original", requireAuth, ah(original));
 router.post("/:id/reply", requireAuth, rateLimit({ scope: "message-reply", windowMs: 15 * 60 * 1000, max: 20 }), ah(reply));
 
 // Admin mailbox — also reachable at /api/admin/messages (see index).
-router.get("/admin/list", requireAdmin, ah(adminList));
-router.post("/admin/reply/:id", requireAdmin, ah(adminReply));
+router.get("/admin/list", requirePermission("messages.view"), ah(adminList));
+router.post("/admin/reply/:id", requirePermission("messages.reply"), ah(adminReply));
 
 export default router;

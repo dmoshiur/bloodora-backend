@@ -2,7 +2,7 @@ import { Router } from "express";
 import { ah } from "../utils/async.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import { optionalAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/admin.js";
+import { requirePermission } from "../middleware/rbac.js";
 import {
   startSession,
   fetchMessages,
@@ -24,11 +24,14 @@ router.get("/stream", streamSession);
 
 // Admin side — mounted at /api/support/admin (original contract).
 export const adminRouter = Router();
-adminRouter.use(requireAdmin);
-adminRouter.get("/sessions", ah(adminSessions));
-adminRouter.get("/sessions/:key/messages", ah(adminMessages));
-adminRouter.post("/sessions/:key/reply", rateLimit({ scope: "support-reply", windowMs: 60 * 1000, max: 60 }), ah(adminReply));
-adminRouter.post("/sessions/:key/close", ah(adminClose));
-adminRouter.get("/stream", adminStream);
+// Reads need `chat.view`; writing needs `chat.reply`, so a moderator can watch
+// the desk without being able to answer it.
+adminRouter.get("/sessions", requirePermission("chat.view"), ah(adminSessions));
+adminRouter.get("/sessions/:key/messages", requirePermission("chat.view"), ah(adminMessages));
+adminRouter.post("/sessions/:key/reply", requirePermission("chat.reply"), rateLimit({ scope: "support-reply", windowMs: 60 * 1000, max: 60 }), ah(adminReply));
+adminRouter.post("/sessions/:key/close", requirePermission("chat.reply"), ah(adminClose));
+// SSE: the guard runs before the stream is opened, and it is deliberately NOT
+// wrapped in ah() — a long-lived response must not go through the async wrapper.
+adminRouter.get("/stream", requirePermission("chat.view"), adminStream);
 
 export default router;

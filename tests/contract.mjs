@@ -51,6 +51,24 @@ async function req(method, url, { token, json, form } = {}) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Fail loudly if something is ALREADY listening on the test port.
+ *
+ * Without this the suite can silently run against a stale server left behind by
+ * an earlier crashed run (a detached child survives its parent), testing old code
+ * against old data and reporting failures that do not exist in the working tree.
+ */
+async function assertPortFree() {
+  try {
+    const res = await fetch(`${BASE}/api/health`, { signal: AbortSignal.timeout(1500) });
+    throw new Error(`Port ${PORT} is already serving (status ${res.status}). Kill the stale process and re-run.`);
+  } catch (err) {
+    const msg = String(err?.message ?? err);
+    if (/already serving/.test(msg)) throw err;
+    return; // nothing answered → the port is free
+  }
+}
+
 async function waitForHealth(child) {
   for (let i = 0; i < 60; i += 1) {
     if (child.exitCode !== null) {
@@ -507,6 +525,7 @@ const main = async () => {
     const ok = await runSuite();
     process.exit(ok ? 0 : 1);
   }
+  await assertPortFree();
   const cwd = mkdtempSync(path.join(tmpdir(), "bloodora-contract-"));
   const child = startServer(cwd);
   try {

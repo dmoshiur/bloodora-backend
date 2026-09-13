@@ -2,7 +2,8 @@ import { settingsService } from "./settings.service.js";
 import { loadSettings } from "./meta.service.js";
 import { aiKnowledgeService } from "./aiKnowledge.service.js";
 import { aiMessageRepo } from "../repos/aiMessage.repo.js";
-import { siteRoutes } from "../data/content.js";
+import { navigationService } from "./navigation.service.js";
+import { extractAnswer, sanitizeAnswer } from "./aiSanitize.js";
 import { config } from "../config/env.js";
 import { ApiError, randomId } from "../utils/errors.js";
 import { str } from "../utils/validate.js";
@@ -10,6 +11,8 @@ import { logger } from "../utils/logger.js";
 import type { AiConfig, AiMessage, AiResult, SafeUser } from "../types.js";
 
 const MAX_CONTEXT_MESSAGES = 12;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const MAX_ANSWER_CHARS = 4000;
 
 export const DEFAULT_MODEL = "qwen/qwen3.6-27b";
@@ -47,20 +50,38 @@ function parsePrompts(raw: string | null | undefined): string[] {
       ];
 }
 
-/** Parse markdown links out of the reply and enrich them with page titles. */
-function extractLinks(text: string): { label: string; path: string; title: string }[] {
+/**
+ * Parse markdown links out of the reply and enrich them with page titles.
+ *
+ * Titles come from the navigation table (with the built-in catalogue as its
+ * seed), so a page an admin renamed or hid is reflected here too.
+ */
+async function extractLinks(text: string): Promise<{ label: string; path: string; title: string }[]> {
   const out: { label: string; path: string; title: string }[] = [];
   const seen = new Set<string>();
+  let index: Map<string, string>;
+  try {
+    index = await navigationService.pathIndex();
+  } catch {
+    index = new Map();
+  }
   const re = /\[([^\]]+)\]\((\/[^\s)]*)\)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text || "")) !== null) {
     const path = m[2].split("?")[0].replace(/[#:].*$/, "");
     if (seen.has(path)) continue;
     seen.add(path);
-    const known = siteRoutes.find(
-      (r: { path: string }) => r.path === path || (r.path.includes("/:") && path.startsWith(r.path.split("/:")[0])),
-    );
-    out.push({ label: m[1], path: m[2], title: known ? (known as { title?: string }).title || m[1] : m[1] });
+    let title = index.get(path) || "";
+    if (!title) {
+      // Parameterized catalogue entries ("/blood-request/:id") match by prefix.
+      for (const [known, knownTitle] of index) {
+        if (known.includes("/:") && path.startsWith(known.split("/:")[0])) {
+          title = knownTitle;
+          break;
+        }
+      }
+    }
+    out.push({ label: m[1], path: m[2], title: title || m[1] });
   }
   return out;
 }
@@ -124,57 +145,106 @@ export const aiService = {
     messages[messages.length - 1] = { role: "user", content: `${q}\n\n[System note: ${langNote}]` };
 
     const url = `${cfg.baseUrl.replace(/\/$/, "")}/chat/completions`;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 60000);
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${cfg.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: cfg.model,
-          messages,
-          temperature: cfg.temperature,
-          max_completion_tokens: cfg.maxTokens,
-          top_p: 0.9,
-        }),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      if ((err as Error).name === "AbortError") {
-        throw new ApiError(504, "AI_TIMEOUT", "The AI provider took too long to respond — please try again.");
-      }
-      logger.error("ai: provider request failed", { err: String(err) });
-      throw new ApiError(502, "AI_UPSTREAM_ERROR", "The AI provider could not be reached. Please try again later.");
-    } finally {
-      clearTimeout(timer);
-    }
+    const payload = JSON.stringify({
+      model: cfg.model,
+      messages,
+      temperature: cfg.temperature,
+      max_completion_tokens: cfg.maxTokens,
+      top_p: 0.9,
+      // Ask the provider to keep reasoning out of the answer where it supports
+      // the hint. This is a hint only — `sanitizeAnswer()` is the guarantee.
+      stream: false,
+    });
 
-    if (!res.ok) {
+    // One retry on a transient failure (network error, 5xx, provider 429).
+    // Never retry a 4xx: a bad key or an invalid model will fail identically and
+    // retrying only doubles the latency of an error the admin must see.
+    let res: Response | null = null;
+    let lastError: ApiError | null = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 60000);
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
+          body: payload,
+          signal: controller.signal,
+        });
+      } catch (err) {
+        clearTimeout(timer);
+        if ((err as Error).name === "AbortError") {
+          lastError = new ApiError(504, "AI_TIMEOUT", "The AI provider took too long to respond — please try again.");
+        } else {
+          logger.error("ai: provider request failed", { attempt, err: String((err as Error)?.message ?? err) });
+          lastError = new ApiError(502, "AI_UPSTREAM_ERROR", "The AI provider could not be reached. Please try again later.");
+        }
+        if (attempt === 1) {
+          await sleep(400);
+          continue;
+        }
+        throw lastError;
+      }
+      clearTimeout(timer);
+
+      if (res.ok) break;
+
       const text = await res.text().catch(() => "");
-      logger.error("ai: provider returned error", { status: res.status, body: text.slice(0, 300) });
+      logger.error("ai: provider returned error", { attempt, status: res.status, body: text.slice(0, 300) });
       if (res.status === 401 || res.status === 403) {
         throw new ApiError(503, "AI_NOT_CONFIGURED", "The AI API key is invalid or has no access. An admin should update Settings → AI.");
       }
       if (res.status === 429) {
-        throw new ApiError(429, "AI_RATE_LIMITED", "The AI provider is rate-limiting us — please wait a moment and retry.");
+        lastError = new ApiError(429, "AI_RATE_LIMITED", "The AI provider is rate-limiting us — please wait a moment and retry.");
+        if (attempt === 1) {
+          await sleep(700);
+          continue;
+        }
+        throw lastError;
+      }
+      if (res.status >= 500) {
+        lastError = new ApiError(502, "AI_UPSTREAM_ERROR", "The AI provider returned an error. Please try again later.");
+        if (attempt === 1) {
+          await sleep(400);
+          continue;
+        }
+        throw lastError;
       }
       throw new ApiError(502, "AI_UPSTREAM_ERROR", "The AI provider returned an error. Please try again later.");
     }
 
-    const data = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-      usage?: { total_tokens?: number };
+    if (!res || !res.ok) throw lastError ?? new ApiError(502, "AI_UPSTREAM_ERROR", "The AI provider returned an error.");
+
+    const data = (await res.json().catch(() => null)) as {
+      choices?: Array<{ message?: { content?: unknown } }>;
+      usage?: { total_tokens?: number; completion_tokens?: number; prompt_tokens?: number };
       model?: string;
-    };
-    const content = (data.choices?.[0]?.message?.content || "").trim().slice(0, MAX_ANSWER_CHARS);
+    } | null;
+
+    // `extractAnswer` reads ONLY `message.content`. Providers that return the
+    // chain of thought in a sibling `reasoning` / `reasoning_content` field are
+    // ignored by construction, so that text can never be forwarded.
+    const rawAnswer = extractAnswer(data?.choices?.[0]);
+    // Reasoning models can also inline it as <think>…</think> inside content.
+    const sanitized = sanitizeAnswer(rawAnswer);
+    if (sanitized.hadReasoning) {
+      logger.warn("ai: stripped internal reasoning from the model answer", {
+        model: data?.model || cfg.model,
+        removedChars: sanitized.removedChars,
+      });
+    }
+    const content = sanitized.text.slice(0, MAX_ANSWER_CHARS);
     if (!content) {
       throw new ApiError(502, "AI_EMPTY_RESPONSE", "The AI returned an empty answer. Please try rephrasing your question.");
     }
-    return { answer: content, model: data.model || cfg.model, tokens: data.usage?.total_tokens ?? null };
+    const tokens = data?.usage?.total_tokens ?? data?.usage?.completion_tokens ?? null;
+    return {
+      answer: content,
+      model: data?.model || cfg.model,
+      tokens,
+      usage: data?.usage ?? null,
+      reasoningChars: sanitized.removedChars,
+    };
   },
 
   /** Preview the knowledge base an admin would feed the model (no live call). */
@@ -229,10 +299,15 @@ export const aiService = {
 
     const result = await this.ask(message, history, { language });
 
-    // Persist both turns (best-effort) and prune old conversations.
+    // Persist both turns (best-effort) and prune old conversations. Only the
+    // sanitized answer is stored, so the admin transcript can never re-expose
+    // reasoning that was stripped on the way out.
     try {
       await aiMessageRepo.add(conversationId, userId, "user", message, cfg.model);
-      await aiMessageRepo.add(conversationId, userId, "assistant", result.answer, cfg.model);
+      await aiMessageRepo.add(conversationId, userId, "assistant", result.answer, cfg.model, {
+        tokens: result.tokens,
+        reasoningChars: result.reasoningChars ?? 0,
+      });
       await aiMessageRepo.prune(300);
     } catch (err) {
       logger.warn("ai: history persistence failed", { err: String(err) });
@@ -242,7 +317,7 @@ export const aiService = {
       success: true,
       conversation_id: conversationId,
       reply: result.answer,
-      links: extractLinks(result.answer),
+      links: await extractLinks(result.answer),
       model: result.model,
       usage: result.tokens ? { total_tokens: result.tokens } : null,
     };
@@ -325,7 +400,9 @@ export const aiService = {
       if (!r.ok) {
         return { success: false, ok: false, ms, model, message: `❌ Groq rejected the request (HTTP ${r.status}): ${data?.error?.message || data?.message || text.slice(0, 200)}` };
       }
-      const reply = (data?.choices?.[0]?.message?.content || "").trim();
+      // Sanitized: the admin test panel renders this string, and a reasoning
+      // model would otherwise dump its chain of thought into the admin UI.
+      const reply = sanitizeAnswer(extractAnswer(data?.choices?.[0])).text.trim();
       return { success: true, ok: true, ms, model, message: `✅ Connection OK — ${model} replied “${reply}” in ${ms} ms.`, reply };
     } catch (e) {
       return { success: false, ok: false, message: `❌ Could not reach Groq: ${(e as Error).message}` };
@@ -353,9 +430,10 @@ export const aiService = {
     }
   },
 
-  /** GET /api/ai/admin/conversations — recent AI conversations. */
+  /** GET /api/ai/admin/conversations — recent AI conversations + usage totals. */
   async adminConversations() {
     const conversations = await aiMessageRepo.recentConversations(50);
+    const [totalTokens, totalTurns] = await Promise.all([aiMessageRepo.totalTokens(), aiMessageRepo.count()]);
     return {
       success: true,
       conversations: conversations.map((c) => ({
@@ -364,6 +442,7 @@ export const aiService = {
         last_at: c.last_at,
         last_question: (c.preview || "").slice(0, 90),
       })),
+      usage: { total_tokens: totalTokens, total_turns: totalTurns },
     };
   },
 

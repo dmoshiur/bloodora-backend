@@ -2,8 +2,11 @@ import type { Request, Response } from "express";
 import { z } from "zod";
 import { parse, str } from "../utils/validate.js";
 import { ApiError } from "../utils/errors.js";
-import { authService } from "../services/auth.service.js";
+import { authService, type AuthCtx } from "../services/auth.service.js";
+import { rbacService } from "../services/rbac.service.js";
 import { userService } from "../services/user.service.js";
+import { resetSharedLimit } from "../middleware/rateLimit.js";
+import { langOf } from "../middleware/language.js";
 import { uploadService } from "../services/upload.service.js";
 import { readUpload } from "../uploads/uploads.js";
 import { singleUpload } from "../uploads/uploads.js";
@@ -40,6 +43,33 @@ const loginSchema = z
   .object({
     email: z.string().trim().email(),
     password: z.string().min(1).max(128),
+  })
+  .strict();
+
+const forgotSchema = z
+  .object({
+    email: z.string().trim().email().max(160),
+  })
+  .strict();
+
+const resetSchema = z
+  .object({
+    // Accept the common aliases so a client can post whichever name it used to
+    // store the link parameter; the service only ever sees `token`.
+    token: z.string().trim().min(8).max(200).optional(),
+    t: z.string().trim().min(8).max(200).optional(),
+    // Length is NOT checked here: `assertPasswordPolicy` owns the rule so that
+    // register / change / reset cannot drift apart, and so the client gets the
+    // localized PASSWORD_SHORT message instead of a generic schema error.
+    password: z.string().max(128).optional(),
+    new_password: z.string().max(128).optional(),
+  })
+  .strict();
+
+const tokenSchema = z
+  .object({
+    token: z.string().trim().min(8).max(200).optional(),
+    t: z.string().trim().min(8).max(200).optional(),
   })
   .strict();
 
@@ -115,11 +145,71 @@ export async function register(req: Request, res: Response): Promise<void> {
   });
 }
 
+/** Caller context for audited auth operations (IP behind a proxy, language). */
+function authCtx(req: Request): AuthCtx {
+  const xff = req.headers["x-forwarded-for"];
+  const ip = typeof xff === "string" && xff.trim() ? xff.split(",")[0].trim() : req.ip || null;
+  return { ip, userAgent: str(req.headers["user-agent"]) ?? null, lang: langOf(req) };
+}
+
 export async function login(req: Request, res: Response): Promise<void> {
   const body = parse(loginSchema, req.body);
-  const result = await authService.login(body.email, body.password);
+  const result = await authService.login(body.email, body.password, authCtx(req));
   if (req.session) req.session.jwt = result.token;
+  // A correct password should not inherit the failures that preceded it: clear
+  // the shared (cross-instance) counter for this IP + email bucket.
+  await resetSharedLimit("login", req, body.email);
   res.json({ user: result.user, token: result.token });
+}
+
+// --------------------- password reset & email verification ---------------------
+
+/**
+ * POST /api/auth/forgot-password — {email}.
+ *
+ * Always answers 200 with the same message (see authService.requestPasswordReset):
+ * the response must not reveal whether the address exists.
+ */
+export async function forgotPassword(req: Request, res: Response): Promise<void> {
+  const body = parse(forgotSchema, req.body);
+  const out = await authService.requestPasswordReset(body.email, authCtx(req));
+  res.json({ success: true, ...out });
+}
+
+/** GET /api/auth/reset-password/validate?token=… — is the link still usable? */
+export async function validateReset(req: Request, res: Response): Promise<void> {
+  const token = str(req.query.token) ?? str(req.query.t);
+  const out = await authService.validateResetToken(token ?? "");
+  res.json({ success: true, ...out });
+}
+
+/** POST /api/auth/reset-password — {token, password}. */
+export async function resetPassword(req: Request, res: Response): Promise<void> {
+  const body = parse(resetSchema, req.body);
+  const token = body.token ?? body.t;
+  const password = body.password ?? body.new_password;
+  if (!token) throw ApiError.badRequest("A reset token is required.", "RESET_TOKEN_REQUIRED");
+  if (!password) throw ApiError.badRequest("A new password is required.", "PASSWORD_REQUIRED");
+  const out = await authService.resetPassword(token, password, authCtx(req));
+  // The reset rotated the session token, so any session on this request is dead.
+  res.clearCookie("connect.sid", { httpOnly: true, sameSite: "lax", secure: config.cookieSecure });
+  res.json({ success: true, ...out });
+}
+
+/** POST /api/auth/verify-email/request — (re)send the verification link. */
+export async function requestVerification(req: Request, res: Response): Promise<void> {
+  if (!req.user) throw ApiError.unauthorized();
+  const out = await authService.requestEmailVerification(req.user, authCtx(req));
+  res.json({ success: true, ...out });
+}
+
+/** POST /api/auth/verify-email — {token}. */
+export async function verifyEmail(req: Request, res: Response): Promise<void> {
+  const body = parse(tokenSchema, req.body ?? {});
+  const token = body.token ?? body.t ?? str(req.query.token);
+  if (!token) throw ApiError.badRequest("A verification token is required.", "VERIFY_TOKEN_REQUIRED");
+  const out = await authService.confirmEmail(token, authCtx(req));
+  res.json({ success: true, ...out });
 }
 
 export async function logout(req: Request, res: Response): Promise<void> {
@@ -140,10 +230,29 @@ export async function logout(req: Request, res: Response): Promise<void> {
   }
 }
 
+/**
+ * GET /api/auth/me — the caller's account plus what it may do.
+ *
+ * `user` keeps its exact original shape (`user.role` is the account role and the
+ * admin dashboard separately reports the donation role). `account_role` and
+ * `permissions` are ADDED so a client can hide UI it is not allowed to use
+ * instead of guessing from `is_admin`.
+ */
 export async function me(req: Request, res: Response): Promise<void> {
   if (!req.user) throw ApiError.unauthorized();
   const user = await authService.me(req.user.id);
-  res.json({ user });
+  let permissions: string[] = [];
+  let accountRole = user.role ?? "user";
+  try {
+    const eff = await rbacService.effective(user);
+    permissions = eff.permissions;
+    accountRole = eff.role;
+  } catch (err) {
+    // Capabilities are additive UI metadata: a roles-table problem must not turn
+    // "who am I?" into a 500.
+    logger.warn("auth: could not resolve permissions for /me", { err: String((err as Error)?.message ?? err) });
+  }
+  res.json({ user, account_role: accountRole, permissions });
 }
 
 export async function updateProfile(req: Request, res: Response): Promise<void> {

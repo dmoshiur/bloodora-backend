@@ -1,18 +1,68 @@
 import { productRepo } from "../repos/product.repo.js";
-import { orderRepo } from "../repos/order.repo.js";
+import { orderRepo, OutOfStockError } from "../repos/order.repo.js";
 import { userRepo } from "../repos/user.repo.js";
 import { activityRepo } from "../repos/activity.repo.js";
 import { reviewRepo } from "../repos/review.repo.js";
-import { smtpService } from "./smtp.service.js";
+import { transactionRepo } from "../repos/transaction.repo.js";
+import { auditRepo } from "../repos/audit.repo.js";
+import { emailService } from "./email.service.js";
+import { paymentService } from "./payment.service.js";
+import { notificationService } from "./notification.service.js";
 import { loadSettings } from "./meta.service.js";
+import { translate } from "../i18n/index.js";
 import { CATEGORIES } from "../data/constants.js";
 import { ApiError, randomId } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import type { Order, OrderItem, OrderRow, ProductRow, SafeUser } from "../types.js";
 
-/** Kalai-only delivery, ৳10 flat (original business rule). */
-const DELIVERY_FEE = 10;
-const DELIVERY_UPAZILAS = ["kalai", "কলাই"];
+/**
+ * Delivery rules.
+ *
+ * The area list and the fee are read from `settings` (Admin → Site Settings),
+ * with the original Kalai-only / ৳10 business rule as the fallback. They used to
+ * be constants here, which meant an admin could change `delivery_fee` in the
+ * panel and the checkout would keep charging ৳10 — the stored configuration was
+ * silently ignored. The backend remains the only authority on price: the client
+ * sends product ids and quantities, never an amount.
+ */
+const DEFAULT_DELIVERY_FEE = 10;
+const DEFAULT_DELIVERY_UPAZILAS = ["kalai", "কলাই"];
+
+async function deliveryRules(): Promise<{ fee: number; upazilas: string[]; freeAbove: number; areas: string[] }> {
+  const s = await loadSettings();
+  const fee = Number.isFinite(Number(s.delivery_fee)) && Number(s.delivery_fee) >= 0 ? Number(s.delivery_fee) : DEFAULT_DELIVERY_FEE;
+  const freeAbove = Number.isFinite(Number(s.free_shipping_threshold)) ? Number(s.free_shipping_threshold) : 0;
+  const areas = String(s.delivery_areas || "")
+    .split(",")
+    .map((a) => a.trim())
+    .filter(Boolean);
+  const upazilas = areas.length ? areas.map((a) => a.toLowerCase()) : DEFAULT_DELIVERY_UPAZILAS;
+  return { fee, upazilas, freeAbove, areas: areas.length ? areas : ["Kalai"] };
+}
+
+/** Money is stored and compared in whole poisha to avoid float drift. */
+function round2(n: number): number {
+  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+}
+
+export interface PricedItem {
+  product: ReturnType<typeof shapeProduct>;
+  quantity: number;
+  unit_price: number;
+  subtotal: number;
+}
+
+export interface PricedCart {
+  items: PricedItem[];
+  /** Items that could not be honoured (lenient mode only). */
+  skipped: { product_id: string; reason: string }[];
+  subtotal: number;
+  delivery_fee: number;
+  total: number;
+  count: number;
+  currency: string;
+  delivery: { areas: string[]; fee: number; free_shipping_threshold: number };
+}
 
 // ---------- shape mappers (original frontend contract field names) ----------
 
@@ -133,26 +183,90 @@ export const shopService = {
    * POST /api/shop/cart/resolve — price a cart map {"<id>": qty}.
    * Original shape: items: [{product, quantity, subtotal}].
    */
-  async resolveCart(cart: Record<string, unknown> = {}): Promise<{ items: { product: ReturnType<typeof shapeProduct>; quantity: number; subtotal: number }[]; subtotal: number; total: number; count: number }> {
-    const items: { product: ReturnType<typeof shapeProduct>; quantity: number; subtotal: number }[] = [];
+  async resolveCart(cart: Record<string, unknown> = {}, lang?: string | null): Promise<PricedCart> {
+    // Display pricing: unavailable items are reported in `skipped` rather than
+    // silently dropped, so the cart page can explain why a line disappeared.
+    return this.priceCart(cart, { strict: false, lang });
+  },
+
+  /**
+   * Authoritative pricing — the ONLY place an order amount is computed.
+   *
+   * Prices come from the `products` table, never from the request. The client
+   * supplies `{productId: qty}` and nothing else that affects money.
+   *
+   * `strict: true` (checkout) rejects anything that cannot be honoured:
+   * an unknown or inactive product, or a quantity above available stock.
+   * `strict: false` (cart page) keeps those items out of the total but reports
+   * them in `skipped`, because a product deleted while it sat in a cart should
+   * not make the whole page fail.
+   */
+  async priceCart(cart: Record<string, unknown> = {}, opts: { strict?: boolean; lang?: string | null } = {}): Promise<PricedCart> {
+    const lang = opts.lang ?? null;
+    const items: PricedItem[] = [];
+    const skipped: { product_id: string; reason: string }[] = [];
     let subtotal = 0;
-    for (const [pid, qty] of Object.entries(cart)) {
+
+    const entries = Object.entries(cart ?? {});
+    if (entries.length > 100) throw ApiError.badRequest("Too many cart lines (max 100).", "CART_TOO_LARGE");
+
+    for (const [pid, qtyRaw] of entries) {
+      const quantity = Math.max(1, Math.min(999, parseInt(String(qtyRaw), 10) || 1));
       const row = await productRepo.findById(pid);
-      if (!row || row.is_active !== 1) continue;
-      const quantity = Math.max(1, parseInt(String(qty), 10) || 1);
-      const itemSubtotal = row.price * quantity;
+      if (!row) {
+        if (opts.strict) throw ApiError.badRequest(translate(lang, "order.unavailable", { product: pid }), "PRODUCT_NOT_FOUND");
+        skipped.push({ product_id: pid, reason: "not_found" });
+        continue;
+      }
+      if (row.is_active !== 1) {
+        if (opts.strict) throw ApiError.badRequest(translate(lang, "order.unavailable", { product: row.name }), "PRODUCT_UNAVAILABLE");
+        skipped.push({ product_id: pid, reason: "inactive" });
+        continue;
+      }
+      if (row.stock < quantity) {
+        if (opts.strict) {
+          throw ApiError.badRequest(
+            translate(lang, "order.out_of_stock", { product: row.name, requested: quantity, available: Math.max(0, row.stock) }),
+            "OUT_OF_STOCK",
+            { product_id: row.id, requested: quantity, available: Math.max(0, row.stock) },
+          );
+        }
+        skipped.push({ product_id: pid, reason: "out_of_stock" });
+        continue;
+      }
+      const itemSubtotal = round2(Number(row.price) * quantity);
       subtotal += itemSubtotal;
-      items.push({ product: shapeProduct(row), quantity, subtotal: itemSubtotal });
+      items.push({ product: shapeProduct(row), quantity, subtotal: itemSubtotal, unit_price: Number(row.price) });
     }
-    subtotal = Math.round(subtotal * 100) / 100;
-    return { items, subtotal, total: subtotal, count: Object.keys(cart).length };
+
+    subtotal = round2(subtotal);
+    const rules = await deliveryRules();
+    const deliveryFee = subtotal > 0 && rules.freeAbove > 0 && subtotal >= rules.freeAbove ? 0 : rules.fee;
+
+    return {
+      items,
+      skipped,
+      subtotal,
+      delivery_fee: opts.strict ? deliveryFee : 0,
+      total: round2(subtotal + (opts.strict ? deliveryFee : 0)),
+      count: items.reduce((n, i) => n + i.quantity, 0),
+      currency: "BDT",
+      delivery: { areas: rules.areas, fee: rules.fee, free_shipping_threshold: rules.freeAbove },
+    };
   },
 
   /** GET /api/shop/checkout/context */
   async checkoutContext(user: SafeUser) {
     const s = await loadSettings();
+    const rules = await deliveryRules();
     return {
       success: true,
+      delivery: {
+        areas: rules.areas,
+        fee: rules.fee,
+        free_shipping_threshold: rules.freeAbove,
+        currency: "BDT",
+      },
       gateway_numbers: {
         bkash: s.bkash_merchant_number || "01709202140",
         nagad: s.nagad_merchant_number || "01800000000",
@@ -184,21 +298,43 @@ export const shopService = {
    *  transaction_id, bkash_number, nagad_number, upay_number, rocket_number,
    *  pathao_number, card_type, card_number}
    */
-  async placeOrder(user: SafeUser, body: Record<string, unknown>): Promise<{ orderId: string; message: string }> {
+  async placeOrder(
+    user: SafeUser,
+    body: Record<string, unknown>,
+    lang?: string | null,
+  ): Promise<{ orderId: string; message: string; total: number; subtotal: number; delivery_fee: number; payment: { reference: string; status: string } }> {
     const cart = (body.cart && typeof body.cart === "object" ? body.cart : {}) as Record<string, unknown>;
-    if (!Object.keys(cart).length) throw ApiError.badRequest("⚠️ Your cart is empty!", "EMPTY_CART");
-
-    const { items, subtotal } = await this.resolveCart(cart);
-    if (!items.length) throw ApiError.badRequest("⚠️ Your cart is empty!", "EMPTY_CART");
+    // Rejections use 400 with a distinct `code`: the frontend renders a 400 as a
+    // "warning" flash the shopper can act on (change the quantity, pick another
+    // area), while any other 4xx becomes a "danger" flash. Codes stay stable so
+    // clients can branch without parsing the localized message.
+    if (!Object.keys(cart).length) {
+      throw ApiError.badRequest(translate(lang, "order.empty_cart"), "EMPTY_CART");
+    }
 
     const str = (k: string) => (body[k] == null ? "" : String(body[k])).trim();
+
     const upazilaNorm = str("upazila").toLowerCase();
-    const deliveryOk = DELIVERY_UPAZILAS.some((u) => upazilaNorm.includes(u));
+    const rules = await deliveryRules();
+    const deliveryOk = upazilaNorm ? rules.upazilas.some((u: string) => upazilaNorm.includes(u)) : true;
     if (!deliveryOk) {
-      throw ApiError.badRequest("❌ Sorry! Home delivery is currently ONLY available in Kalai Upazila.", "DELIVERY_AREA_NOT_SERVED");
+      throw ApiError.badRequest(translate(lang, "order.area_not_served"), "DELIVERY_AREA_NOT_SERVED", {
+        served: rules.areas,
+      });
     }
-    const deliveryFee = DELIVERY_FEE;
-    const total = Math.round((subtotal + deliveryFee) * 100) / 100;
+
+    // Server-authoritative pricing: prices/quantities come from the DB, and a
+    // line that cannot be honoured fails the checkout instead of vanishing.
+    let priced: PricedCart;
+    try {
+      priced = await this.priceCart(cart, { strict: true, lang });
+    } catch (err) {
+      throw err;
+    }
+    if (!priced.items.length) {
+      throw ApiError.badRequest(translate(lang, "order.empty_cart"), "EMPTY_CART");
+    }
+    const { subtotal, delivery_fee: deliveryFee, total } = priced;
 
     // Persist the chosen payment method on the user's wallet.
     const pm = str("payment_method").toLowerCase();
@@ -216,15 +352,15 @@ export const shopService = {
     }
 
     const orderId = randomId();
-    const orderItems = items.map((it) => ({
+    const orderItems = priced.items.map((it) => ({
       id: randomId(),
       order_id: orderId,
       product_id: it.product.id,
       product_name: it.product.name,
       product_image: it.product.image_file,
-      price: it.product.price,
+      price: it.unit_price,
       qty: it.quantity,
-      line_total: Math.round(it.subtotal * 100) / 100,
+      line_total: it.subtotal,
     }));
 
     try {
@@ -251,18 +387,64 @@ export const shopService = {
         orderItems,
       );
     } catch (err) {
+      if (err instanceof OutOfStockError) {
+        // Lost the stock race: the transaction rolled back, so nothing was
+        // written and no stock moved. Tell the shopper exactly what is left.
+        throw ApiError.badRequest(
+          translate(lang, "order.out_of_stock", {
+            product: err.productName,
+            requested: err.requested,
+            available: err.available,
+          }),
+          "OUT_OF_STOCK",
+          { product_id: err.productId, requested: err.requested, available: err.available },
+        );
+      }
       throw err;
     }
+
+    // Ledger entry so the order has an auditable charge from the moment it exists.
+    const charge = await paymentService.ensureCharge(orderId);
 
     const initials = user.name.split(/\s+/).map((w) => w[0]?.toUpperCase() || "").slice(0, 2).join("");
     await activityRepo.create("order", user.id, `New shop order #${orderId}`, {
       detail: `${initials} • ${str("upazila") || user.upazila || "Kalai"} • ৳${total.toFixed(0)}`,
       link: "/shop/my-orders",
     });
-    smtpService.sendOrderConfirmation(orderId).catch((e) => logger.warn("order: confirmation email failed", { err: String(e) }));
-    logger.info("order: placed", { order: orderId, total, user: user.id });
 
-    return { orderId, message: "✅ Order placed successfully! Admin will confirm your payment." };
+    // Buyer confirmation + admin alert. Both go through the outbox, so a slow or
+    // down SMTP host can never block or fail a placed order.
+    void emailService.orderConfirmation(orderId);
+    void emailService.adminAlert(
+      "New shop order",
+      `${user.name} placed order ${orderId} for ৳${total.toFixed(2)} (${pm || "cash"}). Review it in Admin → Orders.`,
+    );
+    void notificationService.emit({
+      event: "order_placed",
+      userIds: [user.id],
+      toAdmins: true,
+      params: { id: orderId, total: `৳${total.toFixed(2)}` },
+      entityId: orderId,
+      dedupeKey: `order-placed:${orderId}`,
+    });
+    void notificationService.emit({
+      event: "admin_new_order",
+      toAdmins: true,
+      params: { id: orderId, total: `৳${total.toFixed(2)}`, name: user.name },
+      entityId: orderId,
+      dedupeKey: `admin-new-order:${orderId}`,
+    });
+
+    logger.info("order: placed", { order: orderId, total, user: user.id, items: priced.items.length });
+
+    return {
+      orderId,
+      message: translate(lang, "order.placed"),
+      total,
+      subtotal,
+      delivery_fee: deliveryFee,
+      payment: { reference: charge?.reference || orderId, status: charge?.status || "pending" },
+    };
   },
 
   /** GET /api/shop/orders/mine */
@@ -303,28 +485,34 @@ export const shopService = {
    * flips the status, so a retried/double cancel cannot restock twice. Admins
    * have their own status endpoint (any state) — this one is user-scoped.
    */
-  async cancelOwnOrder(user: SafeUser, orderId: string): Promise<{ message: string }> {
+  async cancelOwnOrder(user: SafeUser, orderId: string, lang?: string | null): Promise<{ message: string }> {
     const row = await orderRepo.findById(orderId);
-    if (!row) throw ApiError.notFound("Order not found.", "ORDER_NOT_FOUND");
+    if (!row) throw ApiError.notFound(translate(lang, "order.not_found"), "ORDER_NOT_FOUND");
     if (row.user_id !== user.id) {
-      throw ApiError.forbidden("❌ You can only cancel your own orders.", "OWN_ORDERS_ONLY");
+      throw ApiError.forbidden(translate(lang, "order.own_only"), "OWN_ORDERS_ONLY");
     }
     if (row.status !== "pending") {
-      throw ApiError.conflict(
-        "⚠️ This order is already being processed — please use Live Messaging to reach support.",
-        "ORDER_NOT_CANCELLABLE",
-      );
+      throw ApiError.conflict(translate(lang, "order.not_cancellable"), "ORDER_NOT_CANCELLABLE");
     }
+    // Atomic claim: only the caller that actually flipped pending → cancelled
+    // may restore stock or close the ledger row.
     const claimed = await orderRepo.cancelByUserTx(orderId);
     if (!claimed) {
-      throw ApiError.conflict(
-        "⚠️ This order is already being processed — please use Live Messaging to reach support.",
-        "ORDER_NOT_CANCELLABLE",
-      );
+      throw ApiError.conflict(translate(lang, "order.not_cancellable"), "ORDER_NOT_CANCELLABLE");
     }
+    await paymentService.cancelCharge(orderId);
     await activityRepo.create("order_cancel", user.id, `Order ${orderId} was cancelled by the customer`);
+    void notificationService.emit({
+      event: "order_cancelled",
+      userIds: [user.id],
+      toAdmins: true,
+      params: { id: orderId, status: "cancelled" },
+      entityId: orderId,
+      dedupeKey: `order-cancelled:${orderId}`,
+    });
+    void emailService.orderStatus(orderId, "cancelled");
     logger.info("order: cancelled by user", { order: orderId, user: user.id });
-    return { message: "✅ Order cancelled. Stock has been restored." };
+    return { message: translate(lang, "order.cancelled") };
   },
 
   // ---------- admin: products (multipart image) ----------
@@ -334,7 +522,11 @@ export const shopService = {
     return { success: true, products: rows.map(shapeProduct) };
   },
 
-  async adminProductCreate(actor: SafeUser, fields: Record<string, unknown>, imageFile: string | null): Promise<string> {
+  async adminProductCreate(
+    actor: SafeUser,
+    fields: Record<string, unknown>,
+    imageFile: string | null,
+  ): Promise<{ message: string; id: string; product: ReturnType<typeof shapeProduct> }> {
     const str = (k: string) => (fields[k] == null ? "" : String(fields[k])).trim();
     const name = str("name");
     if (!name) throw ApiError.badRequest("Product name is required.", "NAME_REQUIRED");
@@ -355,7 +547,11 @@ export const shopService = {
       sales_count: 0,
     });
     await activityRepo.create("product", actor.id, `Product "${name}" added to the shop`);
-    return "✅ Product added successfully!";
+    // The created row is returned: without its id the caller cannot link to the
+    // product it just made (the panel has to reload the whole catalogue to find
+    // it), and an API client cannot chain create → update.
+    const created = await productRepo.findById(id);
+    return { message: "✅ Product added successfully!", id, product: created ? shapeProduct(created) : shapeProduct({ ...(fields as object), id } as ProductRow) };
   },
 
   async adminProductUpdate(actor: SafeUser, id: string, fields: Record<string, unknown>, imageFile: string | null): Promise<string> {
@@ -399,27 +595,58 @@ export const shopService = {
     return { success: true, order, items: items.map(shapeItem) };
   },
 
-  async adminConfirmPayment(actor: SafeUser, id: string): Promise<string> {
+  async adminConfirmPayment(actor: SafeUser, id: string, ip?: string | null): Promise<string> {
     const row = await orderRepo.findById(id);
     if (!row) throw ApiError.notFound("Order not found.", "ORDER_NOT_FOUND");
     if (row.payment_status === "confirmed") return "ℹ️ Payment already confirmed.";
-    await orderRepo.setStatus(id, row.status, "confirmed");
+    // The payment service owns the ledger row, the audit entry, the buyer
+    // notification and the receipt email — confirming here would double-write.
+    const out = await paymentService.confirmOrderPayment(actor, id, { ip: ip ?? null });
     await activityRepo.create("order_payment", actor.id, `Payment confirmed for order ${id}`);
-    return "✅ Payment confirmed!";
+    return out.message;
   },
 
-  async adminOrderStatus(actor: SafeUser, id: string, status: string): Promise<string> {
+  async adminOrderStatus(actor: SafeUser, id: string, status: string, lang?: string | null): Promise<string> {
     const valid = ["pending", "processing", "shipped", "delivered", "cancelled"];
     if (!valid.includes(status)) throw ApiError.badRequest(`Invalid status (expected one of: ${valid.join(", ")}).`, "BAD_STATUS");
     const row = await orderRepo.findById(id);
-    if (!row) throw ApiError.notFound("Order not found.", "ORDER_NOT_FOUND");
-    if (status === "cancelled" && row.status !== "cancelled") {
-      const items = await orderRepo.items(id);
-      for (const it of items) await productRepo.adjustStock(it.product_id, it.qty);
-    }
-    await orderRepo.setStatus(id, status, status === "cancelled" ? row.payment_status : undefined);
+    if (!row) throw ApiError.notFound(translate(lang, "order.not_found"), "ORDER_NOT_FOUND");
+    if (row.status === status) return translate(lang, "order.status_updated", { status });
+
+    // Status flip + restock-on-cancel in one transaction, guarded by the
+    // transition itself so concurrent cancels cannot restore stock twice.
+    const out = await orderRepo.setStatusTx(id, status, {
+      paymentStatus: status === "cancelled" ? row.payment_status : undefined,
+    });
+    if (!out.changed) return translate(lang, "order.status_updated", { status });
+
+    if (status === "cancelled") await paymentService.markFailed(id, "Order cancelled by admin");
+    await auditRepo
+      .create({
+        actorId: actor.id,
+        actorRole: actor.role || null,
+        action: "order.status",
+        entityType: "order",
+        entityId: id,
+        summary: `Order status ${row.status} → ${status}`,
+        meta: { from: row.status, to: status, restocked: out.restocked },
+      })
+      .catch(() => {});
     await activityRepo.create("order_status", actor.id, `Order ${id} → ${status}`);
-    return `✅ Order status updated to ${status}.`;
+
+    if (row.user_id) {
+      void notificationService.emit({
+        event: status === "cancelled" ? "order_cancelled" : "order_status",
+        userIds: [row.user_id],
+        params: { id, status },
+        entityType: "order",
+        entityId: id,
+        dedupeKey: `order-status:${id}:${status}`,
+      });
+      void emailService.orderStatus(id, status);
+    }
+    logger.info("order: status changed by admin", { order: id, from: row.status, to: status, actor: actor.id, restocked: out.restocked });
+    return translate(lang, "order.status_updated", { status });
   },
 
   // legacy helpers (kept for the admin dashboard service)

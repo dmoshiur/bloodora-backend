@@ -6,6 +6,8 @@ import { contentRepo } from "../repos/content.repo.js";
 import { config } from "../config/env.js";
 import { logger } from "../utils/logger.js";
 import { userRepo } from "../repos/user.repo.js";
+import { rbacService } from "../services/rbac.service.js";
+import { navigationService } from "../services/navigation.service.js";
 import { randomId } from "../utils/errors.js";
 
 let initializing: Promise<void> | null = null;
@@ -31,11 +33,35 @@ async function bootstrap(): Promise<void> {
   const seeded = await seedProducts();
   const imagesSeeded = await seedDefaultImages();
   const contentSeeded = await seedContent();
+
+  // Roles/permissions and the navigation catalogue are configuration the panel
+  // edits at runtime, so they are seeded from code exactly once and then
+  // reconciled on every boot (new keys are granted, revocations are preserved).
+  // A failure here must not stop the app: guards fall back to is_admin and the
+  // meta endpoint falls back to the built-in catalogue.
+  let rolesSeeded = "skipped";
+  let navSeeded = 0;
+  try {
+    await rbacService.seed();
+    rolesSeeded = "ok";
+  } catch (err) {
+    logger.error("db: RBAC seed failed (continuing with is_admin guards)", { err: String((err as Error)?.message ?? err) });
+  }
+  try {
+    navSeeded = await navigationService.ensureSeeded();
+  } catch (err) {
+    logger.error("db: navigation seed failed (continuing with the built-in catalogue)", {
+      err: String((err as Error)?.message ?? err),
+    });
+  }
+
   logger.info("db: schema ready", {
     ms: Date.now() - started,
     productsSeeded: seeded,
     imagesSeeded,
     contentSeeded,
+    rolesSeeded,
+    navigationSeeded: navSeeded,
   });
 
   await seedSuperAdmin();

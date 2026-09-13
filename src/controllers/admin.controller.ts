@@ -1,7 +1,8 @@
 import type { Request, Response } from "express";
 import { adminService } from "../services/admin.service.js";
+import { maintenanceService } from "../services/maintenance.service.js";
 import { ApiError } from "../utils/errors.js";
-import { str } from "../utils/validate.js";
+import { clampInt, str } from "../utils/validate.js";
 import { extFromMime, type UploadedImage } from "../uploads/uploads.js";
 import type { SafeUser } from "../types.js";
 
@@ -170,4 +171,47 @@ export async function switchBack(req: Request, res: Response): Promise<void> {
 
 export async function backup(_req: Request, res: Response): Promise<void> {
   res.json(await adminService.backup());
+}
+
+// ------------------------------- mail outbox -------------------------------
+
+/**
+ * GET /api/admin/mail/outbox — the durable mail queue.
+ *
+ * Every outgoing message is written here BEFORE any SMTP attempt, so a mail host
+ * that is down or slow delays mail instead of failing the operation that caused
+ * it (an order confirmation must never cost somebody their order). This view
+ * shows what is waiting, what went out and what exhausted its retries.
+ */
+export async function mailOutbox(req: Request, res: Response): Promise<void> {
+  actor(req);
+  res.json(
+    await maintenanceService.mailStatus(clampInt(req.query.limit, 25, 1, 100), str(req.query.status) ?? null),
+  );
+}
+
+/** POST /api/admin/mail/flush — retry the queued mail now. */
+export async function mailFlush(req: Request, res: Response): Promise<void> {
+  actor(req);
+  const out = await maintenanceService.flushMail(clampInt(req.body?.limit, 20, 1, 100));
+  res.json({ success: out.ok, task: out.task, ...(out.detail ?? {}), error: out.error ?? null });
+}
+
+// -------------------------------- maintenance --------------------------------
+
+/**
+ * POST /api/admin/maintenance — one idempotent sweep.
+ *
+ * Serverless has no background timer, so retention work (expired reset tokens,
+ * stale rate-limit buckets, bounded history tables) only happens when something
+ * asks for it. Call this from the panel or point an external cron at it.
+ */
+export async function maintenance(req: Request, res: Response): Promise<void> {
+  actor(req);
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const out = await maintenanceService.run({
+    flushMail: body.flush_mail === undefined ? true : Boolean(body.flush_mail),
+    mailLimit: clampInt(body.mail_limit, 20, 1, 100),
+  });
+  res.json(out);
 }

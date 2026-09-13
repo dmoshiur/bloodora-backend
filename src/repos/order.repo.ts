@@ -1,6 +1,24 @@
 import { get, all, run, transaction, type TxExecutor } from "../db/query.js";
 import type { OrderRow, OrderItemRow } from "../types.js";
 
+/**
+ * Thrown inside `placeTx` when the stock re-check fails. The transaction rolls
+ * back, so no order and no partial stock movement survives. The service layer
+ * turns it into a localized `422 OUT_OF_STOCK`.
+ */
+export class OutOfStockError extends Error {
+  readonly code = "OUT_OF_STOCK";
+  constructor(
+    readonly productId: string,
+    readonly productName: string,
+    readonly requested: number,
+    readonly available: number,
+  ) {
+    super(`Insufficient stock for ${productName} (requested ${requested}, available ${available})`);
+    this.name = "OutOfStockError";
+  }
+}
+
 export const orderRepo = {
   async findById(id: string): Promise<OrderRow | null> {
     return get<OrderRow>(`SELECT * FROM orders WHERE id = ?`, [id]);
@@ -80,6 +98,51 @@ export const orderRepo = {
   },
 
   /**
+   * Admin status transition with restock-on-cancel in ONE transaction.
+   *
+   * The previous implementation read the items and adjusted stock in separate
+   * statements before flipping the status, so two admins cancelling the same
+   * order (or a cancel racing the owner's own cancel) restocked the items twice.
+   * Here the status flip is the claim: only the caller whose conditional UPDATE
+   * actually changed a row performs the restock.
+   */
+  async setStatusTx(
+    id: string,
+    status: string,
+    opts: { paymentStatus?: string } = {},
+  ): Promise<{ changed: boolean; restocked: boolean }> {
+    return transaction(async (tx: TxExecutor) => {
+      const current = await tx.get<{ status: string }>(`SELECT status FROM orders WHERE id = ?`, [id]);
+      if (!current) return { changed: false, restocked: false };
+      if (current.status === status && !opts.paymentStatus) return { changed: false, restocked: false };
+
+      await tx.run(
+        opts.paymentStatus
+          ? `UPDATE orders SET status = ?, payment_status = ? WHERE id = ?`
+          : `UPDATE orders SET status = ? WHERE id = ?`,
+        opts.paymentStatus ? [status, opts.paymentStatus, id] : [status, id],
+      );
+
+      // Cancel → restock, but only on the transition INTO cancelled.
+      if (status === "cancelled" && current.status !== "cancelled") {
+        const items = await tx.all<{ product_id: string; qty: number }>(
+          `SELECT product_id, qty FROM order_items WHERE order_id = ?`,
+          [id],
+        );
+        for (const it of items) {
+          await tx.run(`UPDATE products SET stock = stock + ? WHERE id = ?`, [it.qty, it.product_id]);
+          await tx.run(
+            `UPDATE products SET sales_count = CASE WHEN sales_count >= ? THEN sales_count - ? ELSE 0 END WHERE id = ?`,
+            [it.qty, it.qty, it.product_id],
+          );
+        }
+        return { changed: true, restocked: true };
+      }
+      return { changed: true, restocked: false };
+    });
+  },
+
+  /**
    * Atomically cancel a pending order as its owner: the status flip is a
    * conditional claim (`WHERE status = 'pending'`), so a double-cancel or a
    * cancel racing an admin status change can never restock twice.
@@ -131,13 +194,17 @@ export const orderRepo = {
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [item.id, order.id, item.product_id, item.product_name, item.product_image, item.price, item.qty, item.line_total],
         );
-        // Original contract: the stock decrement is a conditional no-op when
-        // there is not enough stock (the order is still placed; the admin
-        // reconciles it). Never reject the order for insufficient stock.
-        if (prod && prod.stock >= item.qty) {
-          await tx.run(`UPDATE products SET stock = stock - ? WHERE id = ?`, [item.qty, item.product_id]);
-          await tx.run(`UPDATE products SET sales_count = sales_count + ? WHERE id = ?`, [item.qty, item.product_id]);
+        // Stock is re-checked INSIDE the transaction. Two concurrent checkouts
+        // for the last unit cannot both succeed: the loser rolls back with
+        // OutOfStockError instead of creating a ghost order or negative stock.
+        if (!prod) {
+          throw new OutOfStockError(item.product_id, item.product_name, item.qty, 0);
         }
+        if (prod.stock < item.qty) {
+          throw new OutOfStockError(item.product_id, item.product_name, item.qty, Math.max(0, prod.stock));
+        }
+        await tx.run(`UPDATE products SET stock = stock - ? WHERE id = ?`, [item.qty, item.product_id]);
+        await tx.run(`UPDATE products SET sales_count = sales_count + ? WHERE id = ?`, [item.qty, item.product_id]);
       }
       await tx.run(
         `INSERT INTO orders

@@ -57,6 +57,13 @@ export interface Config {
   cookieSecure: boolean;
 
   frontendOrigins: string[];
+  /**
+   * The first allowed origin, used as the base for links the backend puts in
+   * emails (password reset, email verification). CORS keeps using the full list.
+   * Empty in production when FRONTEND_URL is unset — callers must not build a
+   * link from it without checking.
+   */
+  frontendUrl: string;
 
   superAdminEmail: string;
   superAdminPassword: string;
@@ -122,6 +129,7 @@ function build(): Config {
     cookieDomain: env.COOKIE_DOMAIN || "",
     cookieSecure: isProd ? true : bool(env.COOKIE_SECURE, false),
     frontendOrigins,
+    frontendUrl: frontendOrigins[0] || "",
     superAdminEmail: (env.SUPER_ADMIN_EMAIL || "").trim(),
     superAdminPassword: env.SUPER_ADMIN_PASSWORD || "",
     superAdminName: env.SUPER_ADMIN_NAME || "Super Admin",
